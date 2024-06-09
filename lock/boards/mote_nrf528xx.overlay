@@ -1,0 +1,65 @@
+/* Copyright (c) 2021 Nordic Semiconductor ASA
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	chosen {
+		nordic,pm-ext-flash = &w25q128;
+	};
+
+	/*
+	* In some default configurations within the nRF Connect SDK,
+	* e.g. on nRF52840, the chosen zephyr,entropy node is &cryptocell.
+	* This devicetree overlay ensures that default is overridden wherever it
+	* is set, as this application uses the RNG node for entropy exclusively.
+	*/
+	chosen {
+		zephyr,entropy = &rng;
+	};
+};
+
+/* Disable unused peripherals to reduce power consumption */
+&adc {
+	status = "disabled";
+};
+&uart1 {
+	status = "disabled";
+};
+&i2c0 {
+	status = "disabled";
+};
+&pwm0 {
+	status = "disabled";
+};
+&spi1 {
+	status = "disabled";
+};
+&spi3 {
+	status = "disabled";
+};
+&usbd {
+	status = "disabled";
+};
+
+&button0 {
+    gpios = <&gpio1 4 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+};
+
+&button1 {
+    gpios = <&gpio0 29 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+};
+
+&button2 {
+    gpios = <&gpio0 2 (GPIO_ACTIVE_HIGH)>;
+};
+
+
+&led0 {
+    gpios = <&gpio0 6 GPIO_ACTIVE_LOW>;
+};
+
+&led2 {
+    gpios = <&gpio1 6 GPIO_ACTIVE_HIGH>;
+};
+

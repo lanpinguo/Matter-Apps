@@ -1,0 +1,126 @@
+// To get started, press Ctrl+Space to bring up the completion menu and view the available nodes.
+
+// You can also use the buttons in the sidebar to perform actions on nodes.
+// Actions currently available include:
+
+// * Enabling / disabling the node
+// * Adding the bus to a bus
+// * Removing the node
+// * Connecting ADC channels
+
+// For more help, browse the DeviceTree documentation at https://docs.zephyrproject.org/latest/guides/dts/index.html
+// You can also visit the nRF DeviceTree extension documentation at https://nrfconnect.github.io/vscode-nrf-connect/devicetree/nrfdevicetree.html
+
+/ {
+	chosen {
+		nordic,pm-ext-flash = &w25q128;
+	};
+
+	/*
+	* In some default configurations within the nRF Connect SDK,
+	* e.g. on nRF52840, the chosen zephyr,entropy node is &cryptocell.
+	* This devicetree overlay ensures that default is overridden wherever it
+	* is set, as this application uses the RNG node for entropy exclusively.
+	*/
+
+	chosen {
+		zephyr,entropy = &rng;
+	};
+
+    locks {
+		compatible = "gpio-leds";
+		lock0: lock_0 {
+			gpios = <&gpio1 6 (GPIO_PULL_DOWN |GPIO_ACTIVE_HIGH)>;
+			label = "lock 0";
+		};
+
+	};
+
+    aliases {
+		lock0 = &lock0;
+	};
+
+    buttons{
+        compatible = "gpio-keys";
+        button1: button_1 {
+            gpios = <&gpio1 0 (GPIO_PULL_UP | GPIO_ACTIVE_HIGH)>;
+            label = "Dial switch bit 2";
+        };
+
+        button2: button_2 {
+            gpios = <&gpio1 1 (GPIO_PULL_UP | GPIO_ACTIVE_HIGH)>;
+            label = "Dial switch bit 3";
+        };
+
+        button3: button_3 {
+            gpios = <&gpio1 15 (GPIO_PULL_UP | GPIO_ACTIVE_HIGH)>;
+            label = "Dial switch bit 0";
+        };
+        button4: button_4 {
+            gpios = <&gpio0 17 (GPIO_PULL_UP | GPIO_ACTIVE_HIGH)>;
+            label = "Dial switch bit 1";
+        };
+
+
+    };
+
+};
+
+
+
+&i2c0 {
+    io_expander_0: io_expander@20{
+        compatible = "i2c-device";
+        reg = < 0x20 >;
+        label = "io_expander0";
+    };
+
+    io_expander_1: io_expander@21{
+        compatible = "i2c-device";
+        reg = < 0x21 >;
+        label = "io_expander1";
+    };
+
+    io_expander_2: io_expander@22{
+        compatible = "i2c-device";
+        reg = < 0x22 >;
+        label = "io_expander2";
+    };
+
+    io_expander_3: io_expander@23{
+        compatible = "i2c-device";
+        reg = < 0x23 >;
+        label = "io_expander3";
+    };
+
+    io_expander_4: io_expander@24{
+        compatible = "i2c-device";
+        reg = < 0x24 >;
+        label = "io_expander4";
+    };
+
+    io_expander_5: io_expander@25{
+        compatible = "i2c-device";
+        reg = < 0x25 >;
+        label = "io_expander5";
+    };
+
+    io_expander_6: io_expander@26{
+        compatible = "i2c-device";
+        reg = < 0x26 >;
+        label = "io_expander6";
+    };
+
+    io_expander_7: io_expander@27{
+        compatible = "i2c-device";
+        reg = < 0x27 >;
+        label = "io_expander7";
+    };
+
+};
+
+
+&flash0 {
+	status = "okay";
+};
+

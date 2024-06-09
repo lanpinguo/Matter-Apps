@@ -1,0 +1,81 @@
+// To get started, press Ctrl+Space to bring up the completion menu and view the available nodes.
+
+// You can also use the buttons in the sidebar to perform actions on nodes.
+// Actions currently available include:
+
+// * Enabling / disabling the node
+// * Adding the bus to a bus
+// * Removing the node
+// * Connecting ADC channels
+
+// For more help, browse the DeviceTree documentation at https://docs.zephyrproject.org/latest/guides/dts/index.html
+// You can also visit the nRF DeviceTree extension documentation at https://nrfconnect.github.io/vscode-nrf-connect/devicetree/nrfdevicetree.html
+
+
+
+/ {
+	chosen {
+		nordic,pm-ext-flash = &w25q128;
+	};
+
+
+
+    buttons {
+
+        button4: button_4 {
+            gpios = <&gpio0 15 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+            label = "Touch switch bit 2";
+        };
+    };
+    
+	/*
+	* In some default configurations within the nRF Connect SDK,
+	* e.g. on nRF52840, the chosen zephyr,entropy node is &cryptocell.
+	* This devicetree overlay ensures that default is overridden wherever it
+	* is set, as this application uses the RNG node for entropy exclusively.
+	*/
+
+	chosen {
+		zephyr,entropy = &rng;
+	};
+
+
+};
+
+
+
+&i2c0_default {
+    group1 {
+        psels = <NRF_PSEL(TWIM_SDA, 0, 29)>,
+            <NRF_PSEL(TWIM_SCL, 0, 2)>;
+    };
+};
+
+&i2c0_sleep {
+    group1 {
+        psels = <NRF_PSEL(TWIM_SDA, 0, 29)>,
+            <NRF_PSEL(TWIM_SCL, 0, 2)>;
+    };
+};
+
+&led1{
+    gpios = <&gpio0 24 GPIO_ACTIVE_LOW>;
+};
+
+&led2{
+    gpios = <&gpio0 22 GPIO_ACTIVE_LOW>;
+};
+
+
+
+
+&button2 {
+    gpios = <&gpio0 12 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+    label = "Touch switch bit 0";
+};
+
+&button3 {
+    gpios = <&gpio0 8 (GPIO_PULL_DOWN | GPIO_ACTIVE_HIGH)>;
+    label = "Touch switch bit 1";
+};
+
