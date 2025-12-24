@@ -7,5 +7,5 @@
 
 # build
 /build*/
-
+build_nrf54
 .vscode/
