@@ -173,12 +173,27 @@ void AppTask::LightingActionEventHandler(const LightingEvent &event)
 
 void AppTask::ButtonEventHandler(Nrf::ButtonState state, Nrf::ButtonMask hasChanged)
 {
+	static int64_t buttonPressedTime = 0;
+
+	// check if the button is pressed
 	if ((APPLICATION_BUTTON_MASK & hasChanged) & state) {
-		Nrf::PostTask([] {
-			LightingEvent event;
-			event.Actor = LightingActor::Button;
-			LightingActionEventHandler(event);
-		});
+		// record the time when the button is pressed
+		buttonPressedTime = k_uptime_get();
+	}
+	// check if the button is released
+	else if ((APPLICATION_BUTTON_MASK & hasChanged) & ~state) {
+		int64_t now = k_uptime_get();
+		if (buttonPressedTime > 0 && (now - buttonPressedTime) >= 5000) { // long press for more than 5 seconds, reset the factory
+			LOG_INF("Factory Reset triggered by long button press");
+			chip::Server::GetInstance().ScheduleFactoryReset();
+		} else if (buttonPressedTime > 0) { // short press, toggle the light state
+			Nrf::PostTask([] {
+				LightingEvent event;
+				event.Actor = LightingActor::Button;
+				LightingActionEventHandler(event);
+			});
+		}
+		buttonPressedTime = 0;
 	}
 }
 
