@@ -1,0 +1,43 @@
+# .gdbinit-mcuboot - MCUboot + Application 调试初始化脚本
+# 使用方法: gdb -x .gdbinit-mcuboot
+
+# 连接到调试器（默认 OpenOCD，端口 3333）
+# 如果使用 J-Link，改为: target remote localhost:2331
+target remote localhost:3333
+
+# 加载 MCUboot 符号表（地址 0x0）
+add-symbol-file build/mcuboot/zephyr/zephyr.elf 0x0
+
+# 加载应用程序符号表（地址 0xC200，Flash 中的地址）
+add-symbol-file build/light_bulb_mote/zephyr/zephyr.elf 0xC200
+
+# 设置 MCUboot 断点
+break main
+break boot_go
+break bootutil_img_validate
+
+# 设置应用程序断点
+break AppTask::StartApp
+break main
+break gpio_pin_configure
+
+# 显示设置
+set listsize 20
+set print pretty on
+set print array on
+set print array-indexes on
+
+# 复位并停止
+monitor reset halt
+
+# 显示断点信息
+info breakpoints
+
+# 显示当前状态
+echo \n========================================\n
+echo MCUboot + Application 调试会话已启动\n
+echo MCUboot 符号表: 0x0\n
+echo Application 符号表: 0xC200\n
+echo 使用 'continue' 开始调试\n
+echo ========================================\n
+
