@@ -160,10 +160,10 @@ void AppTask::LightingActionEventHandler(const LightingEvent &event)
 #else
 	IO_Relay::Action_t action = IO_Relay::INVALID_ACTION;
 	int32_t actor = 0;
-	if (event.Actor == LightingActor::Button) {
-		action = Instance().mIO_RelayDevice.IsTurnedOn() ? IO_Relay::OFF_ACTION : IO_Relay::ON_ACTION;
-		actor = static_cast<int32_t>(event.Actor);
-	}
+	// if (event.Actor == LightingActor::Button) {
+	// 	action = Instance().mIO_RelayDevice.IsTurnedOn(event.Slot) ? IO_Relay::OFF_ACTION : IO_Relay::ON_ACTION;
+	// 	actor = static_cast<int32_t>(event.Actor);
+	// }
 
 	if (action == IO_Relay::INVALID_ACTION || !Instance().mIO_RelayDevice.InitiateAction(action, actor, NULL)) {
 		LOG_INF("An action could not be initiated.");
@@ -264,7 +264,7 @@ void AppTask::UpdateClusterState()
 			Clusters::OnOff::Attributes::OnOff::Set(kLightEndpointId, mPWMDevice.IsTurnedOn());
 #else
 		Protocols::InteractionModel::Status status =
-		Clusters::OnOff::Attributes::OnOff::Set(kLightEndpointId, mIO_RelayDevice.IsTurnedOn());
+		Clusters::OnOff::Attributes::OnOff::Set(kLightEndpointId, mIO_RelayDevice.IsTurnedOn(kLightEndpointId));
 #endif
 		if (status != Protocols::InteractionModel::Status::Success) {
 			LOG_ERR("Updating on/off cluster failed: %x", to_underlying(status));

@@ -89,7 +89,7 @@ void emberAfOnOffClusterInitCallback(EndpointId endpoint)
 			Nrf::PWMDevice::ON_ACTION,
 			static_cast<int32_t>(LightingActor::Remote), reinterpret_cast<uint8_t *>(&storedValue));
 #else
-		AppTask::Instance().GetRelayDevice().Init(false);
+		AppTask::Instance().GetRelayDevice().Init(static_cast<int>(endpoint), false);
         AppTask::Instance().GetRelayDevice().InitiateAction(
 			IO_Relay::ON_ACTION, 
 			static_cast<int32_t>(LightingActor::Remote), reinterpret_cast<uint8_t *>(&storedValue));

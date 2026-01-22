@@ -14,7 +14,6 @@
 #endif
 
 #include <zephyr/logging/log.h>
-#include <zephyr/kernel.h>
 
 #include "io_relay.h"
 
@@ -25,67 +24,59 @@ LOG_MODULE_REGISTER(io_ctrl);
 
 
 
-bool IO_Relay::InitiateAction(Action_t aAction, int32_t aActor, uint8_t *aValue)
-{
-	/* TODO: this function is called InitiateAction because we want to implement some features such as ramping up
-	 * here. */
-	bool action_initiated = false;
-	State_t new_state;
-
-	/* Initiate On/Off Action only when the previous one is complete. */
-	if (mState == kState_Off && aAction == ON_ACTION) {
-		action_initiated = true;
-		new_state = kState_On;
-	} else if (mState == kState_On && aAction == OFF_ACTION) {
-		action_initiated = true;
-		new_state = kState_Off;
-	}
-
-	if (action_initiated) {
-		if (mActionInitiatedClb) {
-			mActionInitiatedClb(aAction, aActor);
-		}
-
-		/* Execute the action */
-		if (aAction == ON_ACTION || aAction == OFF_ACTION) {
-			Set(0, 0, new_state == kState_On ? ON_ACTION : OFF_ACTION);
-			mState = new_state;
-		}
-
-		if (mActionCompletedClb) {
-			mActionCompletedClb(aAction, aActor);
-		}
-	}
-
-	return action_initiated;
-}
-
 int IO_Relay::Set(int slot, int chl, Action_t aAction)
 {
-	ARG_UNUSED(slot);
-	ARG_UNUSED(chl);
+	int ret;
+	uint8_t buf[2] = {0};
 
-	if (aAction == ON_ACTION) {
-		gpio_pin_set_dt(&mRelay1, 1);
-		gpio_pin_set_dt(&mRelay2, 0);
 
-		k_msleep(500);
+	if (!device_is_ready(mIOExpander[slot].bus)) {
+		LOG_ERR("I2C bus %s is not ready!\n\r",mIOExpander[slot].bus->name);
+		return -1;
+	}
 
-		gpio_pin_set_dt(&mRelay1, 1);
-		gpio_pin_set_dt(&mRelay2, 1);
+	/* Keep the i2c pin with right state, recover bus first */
+	i2c_recover_bus(mIOExpander[slot].bus);
 
-	} else {
-		gpio_pin_set_dt(&mRelay1, 0);
-		gpio_pin_set_dt(&mRelay2, 1);
+	ret = i2c_read_dt(&mIOExpander[slot], buf, 1);
+	if(ret != 0){
+		LOG_ERR("Failed to read from I2C device address %x at Reg. %x \n", mIOExpander[slot].addr, buf[0]);
+		return -1;
+	}	
 
-		k_msleep(500);
+	buf[0] = buf[0] & (~(0x3<<(2*chl)));
+	if(aAction == OFF_ACTION){
+		buf[0] |= (0x02 << (2*chl));
+	}
+	else{
+		buf[0] |= (0x01 << (2*chl));
+	}
 
-		gpio_pin_set_dt(&mRelay1, 0);
-		gpio_pin_set_dt(&mRelay2, 0);
+	ret = i2c_write_dt(&mIOExpander[slot], buf, 1);
+	if(ret != 0){
+		LOG_ERR("Failed to write to I2C device address %x at reg. %x \n", mIOExpander[slot].addr, buf[0]);
+		return -1;
+	}
+
+	k_sleep(K_MSEC(10));
+
+	buf[0] = buf[0] & 0xFC;
+	ret = i2c_write_dt(&mIOExpander[slot], buf, 1);
+	if(ret != 0){
+		LOG_ERR("Failed to write to I2C device address %x at reg. %x \n", mIOExpander[slot].addr, buf[0]);
+		return -1;
 	}
 
 	return 0;
 }
 
+bool IO_Relay::InitiateAction(Action_t aAction, int32_t aActor, uint8_t *aValue)
+{
+	return true;
+}
 
-
+void IO_Relay::SetCallbacks(int slot, IO_RelayCallback aActionInitiatedClb, IO_RelayCallback aActionCompletedClb)
+{
+	mActionInitiatedClb[slot] = aActionInitiatedClb;
+	mActionCompletedClb[slot] = aActionCompletedClb;
+}
