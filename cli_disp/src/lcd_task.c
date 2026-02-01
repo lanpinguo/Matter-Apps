@@ -17,9 +17,14 @@
 
 LOG_MODULE_REGISTER(lcd_task, LOG_LEVEL_DBG);
 
-/* LCD尺寸定义 */
+/* LCD尺寸定义 (逻辑宽高，与 MADCTL 方向一致) */
 #define LCD_WIDTH  160
 #define LCD_HEIGHT 80
+
+/* ST7735S 160x80 常见模块：控制器 80 列 x 160 行，MV=1 时显示为 160x80。
+ * 列/行偏移：多数 0.96 寸模块为 col_offset=26, row_offset=1，仅右半屏时请试 26/1 或 24/0。 */
+#define LCD_COL_OFFSET  26
+#define LCD_ROW_OFFSET  1
 
 /* ST7735S命令定义 */
 #define ST7735_NOP        0x00
@@ -176,20 +181,25 @@ static void lcd_write_data_buf(const uint8_t *data, size_t len)
 	gpio_pin_set_raw(gpio_dev, LCD_CS_PIN, 1);
 }
 
-/* 设置显示窗口 */
+/* 设置显示窗口。MADCTL 0xC8 含 MV=1，逻辑 x=控制器行、y=控制器列，故 CASET 用 y、RASET 用 x，并加偏移。 */
 static void lcd_set_window(uint8_t x0, uint8_t y0, uint8_t x1, uint8_t y1)
 {
+	uint8_t cs0 = LCD_COL_OFFSET + y0;
+	uint8_t cs1 = LCD_COL_OFFSET + y1;
+	uint8_t rs0 = LCD_ROW_OFFSET + x0;
+	uint8_t rs1 = LCD_ROW_OFFSET + x1;
+
 	lcd_write_cmd(ST7735_CASET);
 	lcd_write_data(0x00);
-	lcd_write_data(x0);
+	lcd_write_data(cs0);
 	lcd_write_data(0x00);
-	lcd_write_data(x1);
+	lcd_write_data(cs1);
 
 	lcd_write_cmd(ST7735_RASET);
 	lcd_write_data(0x00);
-	lcd_write_data(y0);
+	lcd_write_data(rs0);
 	lcd_write_data(0x00);
-	lcd_write_data(y1);
+	lcd_write_data(rs1);
 
 	lcd_write_cmd(ST7735_RAMWR);
 }
@@ -314,19 +324,18 @@ static void lcd_init_sequence(void)
 	lcd_write_cmd(ST7735_MADCTL);
 	lcd_write_data(0xC8);
 
-	/* 列地址设置 */
+	/* 列/行地址：160x80 时控制器为 80 列 x 160 行(MV=1)，加偏移使可见区居中 */
 	lcd_write_cmd(ST7735_CASET);
 	lcd_write_data(0x00);
+	lcd_write_data(LCD_COL_OFFSET);
 	lcd_write_data(0x00);
-	lcd_write_data(0x00);
-	lcd_write_data(0x9F);  /* 159 = 0x9F */
+	lcd_write_data(LCD_COL_OFFSET + LCD_HEIGHT - 1);  /* 80 列: 26..105 */
 
-	/* 行地址设置 */
 	lcd_write_cmd(ST7735_RASET);
 	lcd_write_data(0x00);
+	lcd_write_data(LCD_ROW_OFFSET);
 	lcd_write_data(0x00);
-	lcd_write_data(0x00);
-	lcd_write_data(0x4F);  /* 79 = 0x4F */
+	lcd_write_data(LCD_ROW_OFFSET + LCD_WIDTH - 1);   /* 160 行: 1..160 */
 
 	/* Gamma设置 */
 	lcd_write_cmd(ST7735_GMCTRP1);
