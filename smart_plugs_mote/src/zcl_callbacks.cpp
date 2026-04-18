@@ -26,6 +26,10 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath &a
 {
 	ClusterId clusterId = attributePath.mClusterId;
 	AttributeId attributeId = attributePath.mAttributeId;
+	EndpointId aEndpointId = attributePath.mEndpointId;
+	const int ep = static_cast<int>(aEndpointId);
+	const int slot = (ep - 1) / 4;
+	const int chl = (ep - 1) % 4;
 
 	if (clusterId == OnOff::Id && attributeId == OnOff::Attributes::OnOff::Id) {
 		ChipLogProgress(Zcl, "Cluster OnOff: attribute OnOff set to %" PRIu8 "", *value);
@@ -35,7 +39,10 @@ void MatterPostAttributeChangeCallback(const chip::app::ConcreteAttributePath &a
 									   Nrf::PWMDevice::OFF_ACTION,
 								  static_cast<int32_t>(LightingActor::Remote), value);
 #else
-		AppTask::Instance().GetRelayDevice().Set(0, 0, *value ? IO_Relay::ON_ACTION : IO_Relay::OFF_ACTION);
+		AppTask::Instance().GetRelayDevice().Set(
+					slot, 
+					chl, 
+					*value ? IO_Relay::ON_ACTION : IO_Relay::OFF_ACTION);
 #endif
 
 #ifdef CONFIG_AWS_IOT_INTEGRATION
@@ -81,20 +88,13 @@ void emberAfOnOffClusterInitCallback(EndpointId endpoint)
 	bool storedValue;
 
     reset_reason = AppTask::Instance().ResetReasonGet();
+	const int ep = static_cast<int>(endpoint);
+	const int slot = (ep - 1) / 4;
+	const int chl = (ep - 1) % 4;
     
     if(reset_reason == BootReasonType::kPowerOnReboot){
-#if defined(CONFIG_PWM)
-		AppTask::Instance().InitPWMDDevice();
-		AppTask::Instance().GetPWMDevice().InitiateAction(
-			Nrf::PWMDevice::ON_ACTION,
-			static_cast<int32_t>(LightingActor::Remote), reinterpret_cast<uint8_t *>(&storedValue));
-#else
-		AppTask::Instance().GetRelayDevice().Init(static_cast<int>(endpoint), false);
-        AppTask::Instance().GetRelayDevice().InitiateAction(
-			IO_Relay::ON_ACTION, 
-			static_cast<int32_t>(LightingActor::Remote), reinterpret_cast<uint8_t *>(&storedValue));
-#endif
-
+		/* Init(slot, chl, defaultOn); must match MatterPostAttributeChangeCallback mapping */
+		AppTask::Instance().GetRelayDevice().Init(slot, chl, false);
     }
 	else{
 		/* Read storedValue on/off value */
@@ -102,17 +102,13 @@ void emberAfOnOffClusterInitCallback(EndpointId endpoint)
 
 		if (status == Protocols::InteractionModel::Status::Success) {
 			/* Set actual state to the cluster state that was last persisted */
-#if defined(CONFIG_PWM)
-			AppTask::Instance().InitPWMDDevice();
 
-			AppTask::Instance().GetPWMDevice().InitiateAction(
-				storedValue ? Nrf::PWMDevice::ON_ACTION : Nrf::PWMDevice::OFF_ACTION,
+			AppTask::Instance().GetRelayDevice().InitiateAction(
+				slot, 
+				chl, 
+				storedValue ? IO_Relay::ON_ACTION : IO_Relay::OFF_ACTION, 
 				static_cast<int32_t>(LightingActor::Remote), reinterpret_cast<uint8_t *>(&storedValue));
-#else
-        AppTask::Instance().GetRelayDevice().InitiateAction(
-			storedValue ? IO_Relay::ON_ACTION : IO_Relay::OFF_ACTION, 
-			static_cast<int32_t>(LightingActor::Remote), reinterpret_cast<uint8_t *>(&storedValue));
-#endif
+
 		}
 	}
 	AppTask::Instance().UpdateClusterState();
