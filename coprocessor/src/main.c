@@ -8,6 +8,8 @@
 
 #if defined(CONFIG_RCP_SAMPLE_HCI)
 #include "rcp_hci.h"
+#elif defined(CONFIG_RCP_SAMPLE_UART)
+#include "rcp_uart.h"
 #endif
 
 LOG_MODULE_REGISTER(coprocessor_sample, CONFIG_OT_COPROCESSOR_LOG_LEVEL);
@@ -25,6 +27,8 @@ int main(void)
 
 #if defined(CONFIG_RCP_SAMPLE_HCI)
 	run_hci();
+#elif defined(CONFIG_RCP_SAMPLE_UART)
+	run_uart();
 #endif
 
 	return 0;
