@@ -22,8 +22,6 @@
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/bluetooth/gatt.h>
 
-#include <bluetooth/services/nsms.h>
-
 #include <zephyr/settings/settings.h>
 
 #include <dk_buttons_and_leds.h>
@@ -31,21 +29,66 @@
 #define DEVICE_NAME             CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN         (sizeof(DEVICE_NAME) - 1)
 
-
 #define RUN_STATUS_LED          DK_LED1
 #define CON_STATUS_LED          DK_LED2
 #define RUN_LED_BLINK_INTERVAL  1000
 #define ADC_SAMPLE_INTERVAL_MS  1000
 #define FIXED_PASSKEY           123456
 
-#define STATUS1_BUTTON             DK_BTN1_MSK
-#define STATUS2_BUTTON             DK_BTN2_MSK
+#define STATUS1_BUTTON          DK_BTN1_MSK
+#define STATUS2_BUTTON          DK_BTN2_MSK
+
+/* Custom service UUID — same base as NSMS but different instance IDs */
+#define MY_SERVICE_UUID_VAL \
+	BT_UUID_128_ENCODE(0x57a70000, 0x9350, 0x11ed, 0xa1eb, 0x0242ac120002)
+
+/* Single status characteristic UUID */
+#define MY_STATUS_CHAR_UUID_VAL \
+	BT_UUID_128_ENCODE(0x57a70006, 0x9350, 0x11ed, 0xa1eb, 0x0242ac120002)
+
+/* Advertising data — use custom service UUID */
+static const struct bt_uuid_128 adv_uuid = BT_UUID_INIT_128(MY_SERVICE_UUID_VAL);
+
+/* Status buffer and mutex for the single characteristic */
+static char status_buf[256];
+static K_MUTEX_DEFINE(status_mtx);
+
+/* Custom GATT service with one characteristic for all status updates */
+static ssize_t my_status_read(struct bt_conn *conn,
+			      const struct bt_gatt_attr *attr,
+			      void *buf, uint16_t len, uint16_t offset)
+{
+	ssize_t ret;
+
+	k_mutex_lock(&status_mtx, K_MSEC(100));
+	ret = bt_gatt_attr_read(conn, attr, buf, len, offset,
+				status_buf, strlen(status_buf));
+	k_mutex_unlock(&status_mtx);
+	return ret;
+}
+
+BT_GATT_SERVICE_DEFINE(my_svc,
+	BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(MY_SERVICE_UUID_VAL)),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(MY_STATUS_CHAR_UUID_VAL),
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ,
+			       my_status_read, NULL,
+			       (void *)status_buf),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+);
+
+/* Send a status notification to all connected peers */
+static void send_status_update(const char *str)
+{
+	k_mutex_lock(&status_mtx, K_MSEC(100));
+	strncpy(status_buf, str, sizeof(status_buf) - 1);
+	status_buf[sizeof(status_buf) - 1] = '\0';
+	k_mutex_unlock(&status_mtx);
+
+	bt_gatt_notify(NULL, &my_svc.attrs[1], str, strlen(str));
+}
 
 static struct k_work adv_work;
-
-/* Implementation of two status characteristics */
-BT_NSMS_DEF(nsms_btn1, "Button 1", false, "Unknown", 20);
-BT_NSMS_DEF(nsms_btn2, "Button 2", false, "Unknown", 20);
 
 #if DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
 #define ADC_STATUS_ENABLED 1
@@ -57,20 +100,10 @@ static const struct adc_dt_spec adc_channels[ADC_CHANNEL_COUNT] = {
 };
 static struct k_work_delayable adc_work;
 static int16_t adc_samples[ADC_CHANNEL_COUNT];
-
-BT_NSMS_DEF(nsms_adc0, "ADC channel 0", false, "Unknown", 32);
-BT_NSMS_DEF(nsms_adc1, "ADC channel 1", false, "Unknown", 32);
-BT_NSMS_DEF(nsms_adc2, "ADC channel 2", false, "Unknown", 32);
-
-static const struct bt_nsms *const adc_nsms[ADC_CHANNEL_COUNT] = {
-	&nsms_adc0,
-	&nsms_adc1,
-	&nsms_adc2,
-};
+static char adc_status_buf[ADC_CHANNEL_COUNT][32];
 #else
 #define ADC_STATUS_ENABLED 0
 #endif
-
 
 static const struct bt_data ad[] = {
 	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -78,7 +111,7 @@ static const struct bt_data ad[] = {
 };
 
 static const struct bt_data sd[] = {
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_NSMS_VAL),
+	BT_DATA_BYTES(BT_DATA_UUID128_ALL, MY_SERVICE_UUID_VAL),
 };
 
 static void adv_work_handler(struct k_work *work)
@@ -106,14 +139,12 @@ static void connected(struct bt_conn *conn, uint8_t err)
 	}
 
 	printk("Connected\n");
-
 	dk_set_led_on(CON_STATUS_LED);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
 	printk("Disconnected, reason 0x%02x %s\n", reason, bt_hci_err_to_str(reason));
-
 	dk_set_led_off(CON_STATUS_LED);
 }
 
@@ -123,95 +154,20 @@ static void recycled_cb(void)
 	advertising_start();
 }
 
-#if IS_ENABLED(CONFIG_BT_STATUS_SECURITY_ENABLED)
-static void security_changed(struct bt_conn *conn, bt_security_t level,
-			     enum bt_security_err err)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	if (!err) {
-		printk("Security changed: %s level %u\n", addr, level);
-	} else {
-		printk("Security failed: %s level %u err %d %s\n", addr, level, err,
-		       bt_security_err_to_str(err));
-	}
-}
-#endif
-
 BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected        = connected,
-	.disconnected     = disconnected,
-	.recycled         = recycled_cb,
-#if IS_ENABLED(CONFIG_BT_STATUS_SECURITY_ENABLED)
-	.security_changed = security_changed,
-#endif
+	.connected    = connected,
+	.disconnected = disconnected,
+	.recycled     = recycled_cb,
 };
-
-#if IS_ENABLED(CONFIG_BT_STATUS_SECURITY_ENABLED)
-static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Passkey for %s: %06u\n", addr, passkey);
-}
-
-static void auth_cancel(struct bt_conn *conn)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing cancelled: %s\n", addr);
-}
-
-static void pairing_complete(struct bt_conn *conn, bool bonded)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing completed: %s, bonded: %d\n", addr, bonded);
-}
-
-static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
-{
-	char addr[BT_ADDR_LE_STR_LEN];
-
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-
-	printk("Pairing failed conn: %s, reason %d %s\n", addr, reason,
-	       bt_security_err_to_str(reason));
-}
-
-static struct bt_conn_auth_cb conn_auth_callbacks = {
-	.passkey_display = auth_passkey_display,
-	.cancel = auth_cancel,
-};
-
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks = {
-	.pairing_complete = pairing_complete,
-	.pairing_failed = pairing_failed
-};
-#else
-static struct bt_conn_auth_cb conn_auth_callbacks;
-static struct bt_conn_auth_info_cb conn_auth_info_callbacks;
-#endif /* IS_ENABLED(CONFIG_BT_STATUS_SECURITY_ENABLED) */
-
 
 static void button_changed(uint32_t button_state, uint32_t has_changed)
 {
-	if (has_changed & STATUS1_BUTTON) {
-		bt_nsms_set_status(&nsms_btn1,
-				   (button_state & STATUS1_BUTTON) ? "Pressed" : "Released");
-	}
-	if (has_changed & STATUS2_BUTTON) {
-		bt_nsms_set_status(&nsms_btn2,
-				   (button_state & STATUS2_BUTTON) ? "Pressed" : "Released");
-	}
+	/* Send combined button state in one notification */
+	char msg[64];
+	const char *btn1 = (button_state & STATUS1_BUTTON) ? "Pressed" : "Released";
+	const char *btn2 = (button_state & STATUS2_BUTTON) ? "Pressed" : "Released";
+	snprintf(msg, sizeof(msg), "BTN1 %s\nBTN2 %s", btn1, btn2);
+	send_status_update(msg);
 }
 
 static int init_button(void)
@@ -231,15 +187,14 @@ static void update_adc_status(size_t index)
 {
 	const struct adc_dt_spec *adc_channel = &adc_channels[index];
 	struct adc_sequence sequence = { 0 };
-	char status[32];
 	int32_t sample_mv;
 	int err;
 
 	err = adc_sequence_init_dt(adc_channel, &sequence);
 	if (err) {
-		snprintk(status, sizeof(status), "ADC%u init err %d",
-			 adc_channel->channel_id, err);
-		goto update_status;
+		snprintk(adc_status_buf[index], sizeof(adc_status_buf[index]),
+			 "CH%u init err %d", adc_channel->channel_id, err);
+		return;
 	}
 
 	sequence.buffer = &adc_samples[index];
@@ -247,35 +202,33 @@ static void update_adc_status(size_t index)
 
 	err = adc_read_dt(adc_channel, &sequence);
 	if (err) {
-		snprintk(status, sizeof(status), "ADC%u read err %d",
-			 adc_channel->channel_id, err);
-		goto update_status;
+		snprintk(adc_status_buf[index], sizeof(adc_status_buf[index]),
+			 "CH%u read err %d", adc_channel->channel_id, err);
+		return;
 	}
 
 	sample_mv = adc_samples[index];
 	err = adc_raw_to_millivolts_dt(adc_channel, &sample_mv);
 	if (err) {
-		snprintk(status, sizeof(status), "CH%u raw %d",
-			 adc_channel->channel_id, adc_samples[index]);
+		snprintk(adc_status_buf[index], sizeof(adc_status_buf[index]),
+			 "CH%u raw %d", adc_channel->channel_id, adc_samples[index]);
 	} else {
-		snprintk(status, sizeof(status), "CH%u %d mV",
-			 adc_channel->channel_id, sample_mv);
-	}
-
-update_status:
-	err = bt_nsms_set_status(adc_nsms[index], status);
-	if (err && err != -ENOTCONN) {
-		printk("Failed to update ADC channel %u status (err %d)\n",
-		       adc_channel->channel_id, err);
+		snprintk(adc_status_buf[index], sizeof(adc_status_buf[index]),
+			 "CH%u %d mV", adc_channel->channel_id, sample_mv);
 	}
 }
 
 static void adc_work_handler(struct k_work *work)
 {
+	char msg[128];
+	char *p = msg;
+
 	for (size_t i = 0; i < ADC_CHANNEL_COUNT; i++) {
 		update_adc_status(i);
+		p += snprintf(p, sizeof(msg) - (p - msg), "%s\n", adc_status_buf[i]);
 	}
 
+	send_status_update(msg);
 	k_work_schedule(&adc_work, K_MSEC(ADC_SAMPLE_INTERVAL_MS));
 }
 
@@ -343,20 +296,6 @@ int main(void)
 	if (err) {
 		printk("ADC init failed (err %d)\n", err);
 		return 0;
-	}
-
-	if (IS_ENABLED(CONFIG_BT_STATUS_SECURITY_ENABLED)) {
-		err = bt_conn_auth_cb_register(&conn_auth_callbacks);
-		if (err) {
-			printk("Failed to register authorization callbacks.\n");
-			return 0;
-		}
-
-		err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
-		if (err) {
-			printk("Failed to register authorization info callbacks.\n");
-			return 0;
-		}
 	}
 
 	err = bt_enable(NULL);
