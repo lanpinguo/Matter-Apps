@@ -45,7 +45,7 @@ static struct k_work adv_work;
 
 /* Implementation of two status characteristics */
 BT_NSMS_DEF(nsms_btn1, "Button 1", false, "Unknown", 20);
-BT_NSMS_DEF(nsms_btn2, "Button 2", IS_ENABLED(CONFIG_BT_STATUS_SECURITY_ENABLED), "Unknown", 20);
+BT_NSMS_DEF(nsms_btn2, "Button 2", false, "Unknown", 20);
 
 #if DT_NODE_HAS_PROP(DT_PATH(zephyr_user), io_channels)
 #define ADC_STATUS_ENABLED 1
