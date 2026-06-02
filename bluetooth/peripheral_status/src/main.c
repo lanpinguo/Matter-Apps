@@ -13,7 +13,9 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/kernel.h>
 #include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/adc.h>
+#include <zephyr/devicetree.h>
 #include <soc.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
@@ -182,6 +184,177 @@ static int init_button(void)
 	return err;
 }
 
+#if DT_HAS_ALIAS(pcf8574a_left) && DT_HAS_ALIAS(pcf8574a_right)
+#define PCF8574_INT_ENABLED 1
+#define PCF_DEV_COUNT 2
+enum {
+	PCF_LEFT = 0,
+	PCF_RIGHT = 1,
+};
+
+static const struct device *const pcf_devs[PCF_DEV_COUNT] = {
+	DEVICE_DT_GET(DT_ALIAS(pcf8574a_left)),
+	DEVICE_DT_GET(DT_ALIAS(pcf8574a_right)),
+};
+static const struct i2c_dt_spec pcf_i2c[PCF_DEV_COUNT] = {
+	I2C_DT_SPEC_GET(DT_ALIAS(pcf8574a_left)),
+	I2C_DT_SPEC_GET(DT_ALIAS(pcf8574a_right)),
+};
+static const char *const pcf_names[PCF_DEV_COUNT] = {
+	"PCF_L",
+	"PCF_R",
+};
+/* Shared INT# from both PCF8574 chips -> P0.02 (active low, open-drain). */
+static const struct gpio_dt_spec pcf_shared_int =
+	GPIO_DT_SPEC_GET(DT_PATH(zephyr_user), pcf8574_int_gpios);
+static struct gpio_callback pcf_int_cb;
+static struct k_work pcf_shared_work;
+static uint8_t pcf_last_state[PCF_DEV_COUNT];
+static bool pcf_last_valid[PCF_DEV_COUNT];
+
+/*
+ * PCF8574 is quasi-bidirectional: write 0xFF to release all pins (input-high).
+ * Use I2C directly so pcf857x driver keeps pins as "input" and gpio_port_get_raw()
+ * still works (it returns -EOPNOTSUPP if pins are marked output in the driver).
+ */
+static int pcf8574_preset_inputs(const struct i2c_dt_spec *i2c, const char *name)
+{
+	uint8_t val = 0xFF;
+	int err;
+
+	if (!device_is_ready(i2c->bus)) {
+		printk("%s I2C bus not ready\n", name);
+		return -ENODEV;
+	}
+
+	err = i2c_write_dt(i2c, &val, 1);
+	if (err) {
+		printk("%s preset 0xFF failed (err %d)\n", name, err);
+	}
+
+	return err;
+}
+
+static void pcf8574a_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+	gpio_port_value_t port_val;
+	char msg[128];
+	char *p = msg;
+	bool has_change = false;
+	int err;
+
+	for (size_t i = 0; i < PCF_DEV_COUNT; i++) {
+		uint8_t cur_state;
+		uint8_t changed_mask;
+
+		err = gpio_port_get_raw(pcf_devs[i], &port_val);
+		if (err) {
+			printk("%s read failed (err %d)\n", pcf_names[i], err);
+			continue;
+		}
+
+		cur_state = (uint8_t)port_val;
+		if (!pcf_last_valid[i]) {
+			pcf_last_state[i] = cur_state;
+			pcf_last_valid[i] = true;
+			continue;
+		}
+
+		changed_mask = cur_state ^ pcf_last_state[i];
+		if (changed_mask == 0U) {
+			continue;
+		}
+
+		pcf_last_state[i] = cur_state;
+		has_change = true;
+		p += snprintf(p, sizeof(msg) - (size_t)(p - msg),
+			      "%s 0x%02x mask 0x%02x\n", pcf_names[i], cur_state, changed_mask);
+	}
+	if (has_change) {
+		printk("%s", msg);
+		send_status_update(msg);
+	}
+}
+
+static void pcf_int_mcu_handler(const struct device *port, struct gpio_callback *cb,
+				uint32_t pins)
+{
+	ARG_UNUSED(port);
+	ARG_UNUSED(cb);
+	ARG_UNUSED(pins);
+
+	k_work_submit(&pcf_shared_work);
+}
+
+static int init_pcf8574_int(void)
+{
+	int err;
+	gpio_port_value_t port_val;
+
+	k_work_init(&pcf_shared_work, pcf8574a_work_handler);
+
+	for (size_t i = 0; i < PCF_DEV_COUNT; i++) {
+		pcf_last_valid[i] = false;
+
+		if (!device_is_ready(pcf_devs[i])) {
+			printk("%s device not ready\n", pcf_names[i]);
+			return -ENODEV;
+		}
+
+		err = pcf8574_preset_inputs(&pcf_i2c[i], pcf_names[i]);
+		if (err) {
+			return err;
+		}
+
+		err = gpio_port_get_raw(pcf_devs[i], &port_val);
+		if (err) {
+			printk("%s initial read failed (err %d)\n", pcf_names[i], err);
+			return err;
+		}
+
+		pcf_last_state[i] = (uint8_t)port_val;
+		pcf_last_valid[i] = true;
+		printk("%s init OK, port=0x%02x\n", pcf_names[i], pcf_last_state[i]);
+	}
+
+	if (!gpio_is_ready_dt(&pcf_shared_int)) {
+		printk("PCF8574 shared INT GPIO not ready\n");
+		return -ENODEV;
+	}
+
+	err = gpio_pin_configure_dt(&pcf_shared_int, GPIO_INPUT);
+	if (err) {
+		printk("PCF8574 INT configure failed (err %d)\n", err);
+		return err;
+	}
+
+	/* INT# is active-low open-drain: trigger on falling edge. */
+	err = gpio_pin_interrupt_configure_dt(&pcf_shared_int, GPIO_INT_EDGE_FALLING);
+	if (err) {
+		printk("PCF8574 INT IRQ configure failed (err %d)\n", err);
+		return err;
+	}
+
+	gpio_init_callback(&pcf_int_cb, pcf_int_mcu_handler, BIT(pcf_shared_int.pin));
+	err = gpio_add_callback(pcf_shared_int.port, &pcf_int_cb);
+	if (err) {
+		printk("PCF8574 INT callback add failed (err %d)\n", err);
+		return err;
+	}
+
+	printk("PCF8574 shared INT ready on %s pin %u\n",
+	       pcf_shared_int.port->name, pcf_shared_int.pin);
+
+	return 0;
+}
+#else
+static int init_pcf8574_int(void)
+{
+	return 0;
+}
+#endif
+
 #if ADC_STATUS_ENABLED
 static void update_adc_status(size_t index)
 {
@@ -289,6 +462,12 @@ int main(void)
 	err = init_button();
 	if (err) {
 		printk("Button init failed (err %d)\n", err);
+		return 0;
+	}
+
+	err = init_pcf8574_int();
+	if (err) {
+		printk("PCF8574 interrupt init failed (err %d)\n", err);
 		return 0;
 	}
 
