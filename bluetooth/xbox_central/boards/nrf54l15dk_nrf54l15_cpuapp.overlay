@@ -1,0 +1,11 @@
+/*
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+&uart30 {
+	status = "okay";
+	current-speed = <1000000>;
+	pinctrl-0 = <&uart30_default>;
+	pinctrl-1 = <&uart30_sleep>;
+	pinctrl-names = "default", "sleep";
+};
