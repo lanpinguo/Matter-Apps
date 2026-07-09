@@ -36,7 +36,9 @@ static int validate_frame_meta(uint8_t magic, uint8_t type, uint8_t channel_coun
 		return -EPROTO;
 	}
 
-	if (type != RC_LINK_TYPE_CTRL && type != RC_LINK_TYPE_STATUS) {
+	if (type != RC_LINK_TYPE_CTRL &&
+	    type != RC_LINK_TYPE_STATUS &&
+	    type != RC_LINK_TYPE_PAIR) {
 		return -EPROTO;
 	}
 
@@ -45,6 +47,38 @@ static int validate_frame_meta(uint8_t magic, uint8_t type, uint8_t channel_coun
 	}
 
 	return 0;
+}
+
+static void pair_payload_to_words(const struct rc_link_pair_payload *pair, uint16_t words[8])
+{
+	words[0] = (uint16_t)pair->base0[0] | ((uint16_t)pair->base0[1] << 8);
+	words[1] = (uint16_t)pair->base0[2] | ((uint16_t)pair->base0[3] << 8);
+	words[2] = (uint16_t)pair->base1[0] | ((uint16_t)pair->base1[1] << 8);
+	words[3] = (uint16_t)pair->base1[2] | ((uint16_t)pair->base1[3] << 8);
+	words[4] = (uint16_t)pair->prefixes[0] | ((uint16_t)pair->prefixes[1] << 8);
+	words[5] = (uint16_t)pair->prefixes[2] | ((uint16_t)pair->prefixes[3] << 8);
+	words[6] = (uint16_t)pair->prefixes[4] | ((uint16_t)pair->prefixes[5] << 8);
+	words[7] = (uint16_t)pair->prefixes[6] | ((uint16_t)pair->prefixes[7] << 8);
+}
+
+static void words_to_pair_payload(const uint16_t words[8], struct rc_link_pair_payload *pair)
+{
+	pair->base0[0] = (uint8_t)(words[0] & 0xFFU);
+	pair->base0[1] = (uint8_t)((words[0] >> 8) & 0xFFU);
+	pair->base0[2] = (uint8_t)(words[1] & 0xFFU);
+	pair->base0[3] = (uint8_t)((words[1] >> 8) & 0xFFU);
+	pair->base1[0] = (uint8_t)(words[2] & 0xFFU);
+	pair->base1[1] = (uint8_t)((words[2] >> 8) & 0xFFU);
+	pair->base1[2] = (uint8_t)(words[3] & 0xFFU);
+	pair->base1[3] = (uint8_t)((words[3] >> 8) & 0xFFU);
+	pair->prefixes[0] = (uint8_t)(words[4] & 0xFFU);
+	pair->prefixes[1] = (uint8_t)((words[4] >> 8) & 0xFFU);
+	pair->prefixes[2] = (uint8_t)(words[5] & 0xFFU);
+	pair->prefixes[3] = (uint8_t)((words[5] >> 8) & 0xFFU);
+	pair->prefixes[4] = (uint8_t)(words[6] & 0xFFU);
+	pair->prefixes[5] = (uint8_t)((words[6] >> 8) & 0xFFU);
+	pair->prefixes[6] = (uint8_t)(words[7] & 0xFFU);
+	pair->prefixes[7] = (uint8_t)((words[7] >> 8) & 0xFFU);
 }
 
 int rc_link_pack(const struct rc_link_frame *frame, uint8_t *buf, size_t buf_len)
@@ -120,5 +154,38 @@ int rc_link_unpack(const uint8_t *buf, size_t buf_len, struct rc_link_frame *fra
 		frame->channels[i] = sys_get_le16(&buf[RC_LINK_HEADER_SIZE + (i * 2U)]);
 	}
 
+	return 0;
+}
+
+int rc_link_pair_encode(const struct rc_link_pair_payload *pair, uint8_t seq,
+			struct rc_link_frame *frame)
+{
+	if (pair == NULL || frame == NULL) {
+		return -EINVAL;
+	}
+
+	frame->magic = RC_LINK_MAGIC;
+	frame->type = RC_LINK_TYPE_PAIR;
+	frame->seq = seq;
+	frame->flags = 0U;
+	frame->channel_count = RC_LINK_PAIR_WORDS;
+	pair_payload_to_words(pair, frame->channels);
+
+	return 0;
+}
+
+int rc_link_pair_decode(const struct rc_link_frame *frame, struct rc_link_pair_payload *pair)
+{
+	if (frame == NULL || pair == NULL) {
+		return -EINVAL;
+	}
+
+	if (frame->magic != RC_LINK_MAGIC ||
+	    frame->type != RC_LINK_TYPE_PAIR ||
+	    frame->channel_count != RC_LINK_PAIR_WORDS) {
+		return -EPROTO;
+	}
+
+	words_to_pair_payload(frame->channels, pair);
 	return 0;
 }

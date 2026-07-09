@@ -15,11 +15,13 @@
 
 #define RC_LINK_TYPE_CTRL   0x01U
 #define RC_LINK_TYPE_STATUS 0x02U
+#define RC_LINK_TYPE_PAIR   0x03U
 
 #define RC_LINK_HEADER_SIZE 5U
 #define RC_LINK_CRC_SIZE    1U
 #define RC_LINK_MIN_FRAME_SIZE (RC_LINK_HEADER_SIZE + RC_LINK_CRC_SIZE)
 #define RC_LINK_MAX_CHANNELS   16U
+#define RC_LINK_PAIR_WORDS     8U
 
 #define RC_STATUS_FLAG_ARMED    0x01U
 #define RC_STATUS_FLAG_FAILSAFE 0x02U
@@ -33,6 +35,12 @@ struct rc_link_frame {
 	uint16_t channels[RC_LINK_MAX_CHANNELS];
 };
 
+struct rc_link_pair_payload {
+	uint8_t base0[4];
+	uint8_t base1[4];
+	uint8_t prefixes[8];
+};
+
 static inline size_t rc_link_frame_wire_size(uint8_t channel_count)
 {
 	return RC_LINK_MIN_FRAME_SIZE + ((size_t)channel_count * sizeof(uint16_t));
@@ -40,5 +48,8 @@ static inline size_t rc_link_frame_wire_size(uint8_t channel_count)
 
 int rc_link_pack(const struct rc_link_frame *frame, uint8_t *buf, size_t buf_len);
 int rc_link_unpack(const uint8_t *buf, size_t buf_len, struct rc_link_frame *frame);
+int rc_link_pair_encode(const struct rc_link_pair_payload *pair, uint8_t seq,
+			struct rc_link_frame *frame);
+int rc_link_pair_decode(const struct rc_link_frame *frame, struct rc_link_pair_payload *pair);
 
 #endif /* RC_LINK_H_ */

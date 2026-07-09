@@ -27,19 +27,37 @@
 #endif /* defined(NRF54LM20A_ENGA_XXAA) */
 
 #include "rc_channel_bank.h"
+#include "rc_esb_radio.h"
 #include "rc_link.h"
 #include "rc_ptx_channels.h"
+#include "rc_ptx_uart_channels.h"
+#include "rc_uart_bridge.h"
 
 LOG_MODULE_REGISTER(esb_ptx, CONFIG_ESB_PTX_APP_LOG_LEVEL);
 
 #define TX_INTERVAL_MS 100
+#define PAIR_TX_INTERVAL_MS 1000
 
 static bool ready = true;
 static uint8_t ctrl_seq;
+static uint8_t pair_seq;
 static uint8_t peer_status_channels;
 static struct esb_payload rx_payload;
 static struct esb_payload tx_payload;
 static struct rc_link_frame ctrl_frame;
+static int64_t next_pair_tx_ms;
+static bool pending_pair_restore;
+static struct uart_rc_esb_config saved_paired_cfg;
+
+static void restore_paired_radio_cfg(void)
+{
+	if (!pending_pair_restore) {
+		return;
+	}
+
+	(void)rc_esb_radio_apply_cfg(&saved_paired_cfg);
+	pending_pair_restore = false;
+}
 
 static void leds_update(uint8_t value)
 {
@@ -69,6 +87,7 @@ static void handle_status_frame(const struct esb_payload *payload)
 	}
 
 	rc_link_log_channels("Telemetry", &status);
+	rc_uart_bridge_on_esb_status(&status);
 }
 
 void event_handler(struct esb_evt const *event)
@@ -77,9 +96,11 @@ void event_handler(struct esb_evt const *event)
 
 	switch (event->evt_id) {
 	case ESB_EVENT_TX_SUCCESS:
+		restore_paired_radio_cfg();
 		LOG_DBG("Control frame sent");
 		break;
 	case ESB_EVENT_TX_FAILED:
+		restore_paired_radio_cfg();
 		LOG_DBG("Control frame failed");
 		break;
 	case ESB_EVENT_RX_RECEIVED:
@@ -173,44 +194,7 @@ BUILD_ASSERT(false, "No Clock Control driver");
 
 int esb_initialize(void)
 {
-	int err;
-	uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
-	uint8_t base_addr_1[4] = {0xC2, 0xC2, 0xC2, 0xC2};
-	uint8_t addr_prefix[8] = {0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8};
-	struct esb_config config = ESB_DEFAULT_CONFIG;
-
-	config.protocol = ESB_PROTOCOL_ESB_DPL;
-	config.retransmit_delay = 600;
-	config.bitrate = ESB_BITRATE_2MBPS;
-	config.event_handler = event_handler;
-	config.mode = ESB_MODE_PTX;
-	config.selective_auto_ack = true;
-	config.tx_output_power = 8;
-	if (IS_ENABLED(CONFIG_ESB_FAST_SWITCHING)) {
-		config.use_fast_ramp_up = true;
-	}
-
-	err = esb_init(&config);
-	if (err) {
-		return err;
-	}
-
-	err = esb_set_base_address_0(base_addr_0);
-	if (err) {
-		return err;
-	}
-
-	err = esb_set_base_address_1(base_addr_1);
-	if (err) {
-		return err;
-	}
-
-	err = esb_set_prefixes(addr_prefix, ARRAY_SIZE(addr_prefix));
-	if (err) {
-		return err;
-	}
-
-	return 0;
+	return rc_esb_radio_init(event_handler);
 }
 
 static int pack_ctrl_payload(struct esb_payload *payload)
@@ -218,6 +202,35 @@ static int pack_ctrl_payload(struct esb_payload *payload)
 	int len;
 
 	len = rc_link_pack(&ctrl_frame, payload->data, sizeof(payload->data));
+	if (len < 0) {
+		return len;
+	}
+
+	payload->length = (uint8_t)len;
+	payload->pipe = RC_LINK_PIPE;
+	payload->noack = false;
+
+	return 0;
+}
+
+static int pack_pair_payload(struct esb_payload *payload)
+{
+	struct rc_link_pair_payload pair_payload;
+	struct rc_link_frame pair_frame;
+	int err;
+	int len;
+
+	err = rc_esb_radio_export_pair_payload(&pair_payload);
+	if (err != 0) {
+		return err;
+	}
+
+	err = rc_link_pair_encode(&pair_payload, pair_seq++, &pair_frame);
+	if (err != 0) {
+		return err;
+	}
+
+	len = rc_link_pack(&pair_frame, payload->data, sizeof(payload->data));
 	if (len < 0) {
 		return len;
 	}
@@ -254,29 +267,59 @@ int main(void)
 		return 0;
 	}
 
+	err = rc_uart_bridge_init();
+	if (err) {
+		LOG_ERR("UART RC bridge init failed, err %d", err);
+		return 0;
+	}
+
 	LOG_INF("Local control sources: %u", (unsigned int)rc_ptx_control_bank.slot_count);
 	LOG_INF("Sending control frames every %d ms", TX_INTERVAL_MS);
+	next_pair_tx_ms = k_uptime_get();
 
 	while (1) {
 		if (ready) {
 			ready = false;
 			esb_flush_tx();
 
-			err = rc_link_frame_fill(&ctrl_frame, RC_LINK_TYPE_CTRL, ctrl_seq++, 0,
-						 &rc_ptx_control_bank);
-			if (err) {
-				LOG_ERR("Prepare control frame failed: %d", err);
-				ready = true;
-				continue;
-			}
+			struct uart_rc_esb_config paired_cfg;
 
-			if (ctrl_frame.channel_count > 1U) {
-				leds_update((uint8_t)ctrl_frame.channels[1]);
-			}
+			if (k_uptime_get() >= next_pair_tx_ms) {
+				next_pair_tx_ms = k_uptime_get() + PAIR_TX_INTERVAL_MS;
 
-			err = pack_ctrl_payload(&tx_payload);
+				(void)rc_esb_radio_get_config(&paired_cfg);
+				err = pack_pair_payload(&tx_payload);
+				if (err) {
+					LOG_ERR("Pack pair frame failed: %d", err);
+					ready = true;
+					continue;
+				}
+
+				err = rc_esb_radio_apply_pair_listen();
+				if (err != 0) {
+					LOG_ERR("Apply pair listen failed: %d", err);
+					ready = true;
+					continue;
+				}
+				saved_paired_cfg = paired_cfg;
+				pending_pair_restore = true;
+			} else {
+				err = rc_link_frame_fill(&ctrl_frame, RC_LINK_TYPE_CTRL, ctrl_seq++, 0,
+							 rc_ptx_get_active_control_bank());
+				if (err) {
+					LOG_ERR("Prepare control frame failed: %d", err);
+					ready = true;
+					continue;
+				}
+
+				if (ctrl_frame.channel_count > 1U) {
+					leds_update((uint8_t)ctrl_frame.channels[1]);
+				}
+
+				err = pack_ctrl_payload(&tx_payload);
+			}
 			if (err) {
-				LOG_ERR("Pack control frame failed: %d", err);
+				LOG_ERR("Pack TX frame failed: %d", err);
 				ready = true;
 				continue;
 			}
@@ -284,6 +327,7 @@ int main(void)
 			err = esb_write_payload(&tx_payload);
 			if (err) {
 				LOG_ERR("Payload write failed, err %d", err);
+				restore_paired_radio_cfg();
 				ready = true;
 			}
 		}

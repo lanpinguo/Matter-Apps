@@ -15,13 +15,13 @@
 #include <zephyr/sys/printk.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/settings/settings.h>
+#include <zephyr/logging/log.h>
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/hci.h>
 #include <zephyr/bluetooth/uuid.h>
-#include <zephyr/drivers/uart.h>
 
 #include <bluetooth/gatt_dm.h>
 #include <bluetooth/scan.h>
@@ -30,6 +30,7 @@
 
 #include "xbox_hids.h"
 #include "xbox_report.h"
+#include "uart_rc_link.h"
 
 #define CONN_LED                       DK_LED1
 #define REPORT_LOG_INTERVAL_MS         100
@@ -41,6 +42,8 @@
 
 #define KEY_PAIRING_ACCEPT             DK_BTN1_MSK
 #define KEY_PAIRING_REJECT             DK_BTN2_MSK
+#define KEY_ESB_DEBUG_TOGGLE           DK_BTN3_MSK
+#define KEY_ESB_PAIR                   DK_BTN4_MSK
 
 #define HUB_UUID_W1 0x9350
 #define HUB_UUID_W2 0x11ed
@@ -49,12 +52,6 @@
 #define HUB_SVC_UUID_VAL BT_UUID_128_ENCODE(0x57a71000, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 #define HUB_TELEM_UUID_VAL BT_UUID_128_ENCODE(0x57a71001, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 #define HUB_CFG_UUID_VAL BT_UUID_128_ENCODE(0x57a71002, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
-
-#define UART_PROTO_MAGIC               0xA6U
-#define UART_MSG_CTRL                  0x01U
-#define UART_MSG_STATUS                0x02U
-#define UART_CTRL_CHANNELS             6U
-#define UART_RX_MAX_PAYLOAD            32U
 
 struct hub_telemetry_payload {
 	uint8_t version;
@@ -89,13 +86,13 @@ static struct k_work_delayable adv_restart_work;
 static struct k_work_delayable adv_guard_work;
 static uint8_t adv_restart_attempts;
 static bool adv_running;
-static const struct device *uart_dev;
+static struct uart_rc_link uart_link;
 static uint8_t uart_ctrl_seq;
-static uint8_t uart_rx_state;
-static uint8_t uart_rx_type;
-static uint8_t uart_rx_len;
-static uint8_t uart_rx_pos;
-static uint8_t uart_rx_payload[UART_RX_MAX_PAYLOAD];
+static uint8_t uart_esb_req_seq;
+static uint8_t uart_debug_ctrl_seq;
+static bool uart_debug_forward_enabled;
+static struct uart_rc_esb_config uart_paired_cfg;
+static bool uart_paired_cfg_valid;
 
 static ssize_t telemetry_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				 void *buf, uint16_t len, uint16_t offset);
@@ -135,18 +132,6 @@ static void set_conn_led(bool on)
 	(void)dk_set_led(CONN_LED, on ? 1 : 0);
 }
 
-static uint8_t uart_checksum(const uint8_t *buf, size_t len)
-{
-	uint8_t c = 0U;
-	size_t i;
-
-	for (i = 0; i < len; i++) {
-		c ^= buf[i];
-	}
-
-	return c;
-}
-
 static uint16_t axis_to_rc(int16_t axis)
 {
 	int32_t v = ((int32_t)axis + 32767) * 1000 / 65534;
@@ -160,156 +145,169 @@ static uint16_t axis_to_rc(int16_t axis)
 	return (uint16_t)v;
 }
 
-static int uart_send_packet(uint8_t type, const uint8_t *payload, uint8_t len)
+static void on_uart_status(const struct uart_rc_link_status *status, void *user_data)
 {
-	uint8_t frame[3 + UART_RX_MAX_PAYLOAD + 1];
-	uint8_t checksum;
-	size_t i;
-
-	if (len > UART_RX_MAX_PAYLOAD || uart_dev == NULL) {
-		return -EINVAL;
-	}
-
-	frame[0] = UART_PROTO_MAGIC;
-	frame[1] = type;
-	frame[2] = len;
-	memcpy(&frame[3], payload, len);
-	checksum = uart_checksum(frame, 3U + len);
-	frame[3U + len] = checksum;
-
-	for (i = 0; i < (size_t)(4U + len); i++) {
-		uart_poll_out(uart_dev, frame[i]);
-	}
-
-	return 0;
-}
-
-static void uart_send_ctrl_from_state(const struct xbox_gamepad_state *s)
-{
-	uint8_t payload[2 + UART_CTRL_CHANNELS * 2];
-	uint16_t ch[UART_CTRL_CHANNELS];
-
-	ch[0] = axis_to_rc(s->lx);
-	ch[1] = axis_to_rc(s->ly);
-	ch[2] = axis_to_rc(s->rx);
-	ch[3] = axis_to_rc(s->ry);
-	ch[4] = s->lt;
-	ch[5] = s->rt;
-
-	payload[0] = uart_ctrl_seq++;
-	payload[1] = UART_CTRL_CHANNELS;
-	sys_put_le16(ch[0], &payload[2]);
-	sys_put_le16(ch[1], &payload[4]);
-	sys_put_le16(ch[2], &payload[6]);
-	sys_put_le16(ch[3], &payload[8]);
-	sys_put_le16(ch[4], &payload[10]);
-	sys_put_le16(ch[5], &payload[12]);
-
-	(void)uart_send_packet(UART_MSG_CTRL, payload, sizeof(payload));
-}
-
-static void uart_apply_status(const uint8_t *payload, uint8_t len)
-{
-	/* seq(1), roll(i16), pitch(i16), yaw(i16), batt(u16), flags(1) */
-	if (len < 10U) {
-		return;
-	}
+	ARG_UNUSED(user_data);
 
 	k_mutex_lock(&data_mutex, K_FOREVER);
-	telemetry_data.roll = (int16_t)sys_get_le16(&payload[1]);
-	telemetry_data.pitch = (int16_t)sys_get_le16(&payload[3]);
-	telemetry_data.yaw = (int16_t)sys_get_le16(&payload[5]);
+	telemetry_data.roll = status->roll;
+	telemetry_data.pitch = status->pitch;
+	telemetry_data.yaw = status->yaw;
 	telemetry_data.flags |= BIT(1);
 	k_mutex_unlock(&data_mutex);
 }
 
-static void uart_proto_reset(void)
+static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 {
-	uart_rx_state = 0U;
-	uart_rx_type = 0U;
-	uart_rx_len = 0U;
-	uart_rx_pos = 0U;
-}
-
-static void uart_proto_feed(uint8_t b)
-{
-	uint8_t check_buf[3 + UART_RX_MAX_PAYLOAD];
-	uint8_t check;
-
-	switch (uart_rx_state) {
-	case 0:
-		if (b == UART_PROTO_MAGIC) {
-			uart_rx_state = 1U;
-		}
-		break;
-	case 1:
-		uart_rx_type = b;
-		uart_rx_state = 2U;
-		break;
-	case 2:
-		uart_rx_len = b;
-		if (uart_rx_len > UART_RX_MAX_PAYLOAD) {
-			uart_proto_reset();
-		} else if (uart_rx_len == 0U) {
-			uart_rx_state = 4U;
-		} else {
-			uart_rx_pos = 0U;
-			uart_rx_state = 3U;
-		}
-		break;
-	case 3:
-		uart_rx_payload[uart_rx_pos++] = b;
-		if (uart_rx_pos >= uart_rx_len) {
-			uart_rx_state = 4U;
-		}
-		break;
-	case 4:
-		check_buf[0] = UART_PROTO_MAGIC;
-		check_buf[1] = uart_rx_type;
-		check_buf[2] = uart_rx_len;
-		memcpy(&check_buf[3], uart_rx_payload, uart_rx_len);
-		check = uart_checksum(check_buf, 3U + uart_rx_len);
-		if (check == b && uart_rx_type == UART_MSG_STATUS) {
-			uart_apply_status(uart_rx_payload, uart_rx_len);
-		}
-		uart_proto_reset();
-		break;
-	default:
-		uart_proto_reset();
-		break;
-	}
-}
-
-static void uart_isr(const struct device *dev, void *user_data)
-{
-	uint8_t buf[16];
-	int rd;
-	size_t i;
+	struct uart_rc_esb_config cfg;
 
 	ARG_UNUSED(user_data);
 
-	while (uart_irq_update(dev) && uart_irq_rx_ready(dev)) {
-		rd = uart_fifo_read(dev, buf, sizeof(buf));
-		if (rd <= 0) {
-			break;
-		}
-		for (i = 0; i < (size_t)rd; i++) {
-			uart_proto_feed(buf[i]);
-		}
+	if (rsp->status != 0) {
+		printk("ESB rsp cmd=0x%02x failed: %d\n", rsp->cmd, rsp->status);
+		return;
 	}
+
+	switch (rsp->cmd) {
+	case UART_RC_ESB_CMD_GET_CONFIG:
+	case UART_RC_ESB_CMD_PAIR:
+		if (rsp->data_len >= sizeof(cfg) &&
+		    uart_rc_link_decode_esb_config(rsp->data, rsp->data_len, &cfg) == 0) {
+			printk("ESB cfg pipe=%u pwr=%d delay=%u\n", cfg.pipe, cfg.tx_power,
+			       cfg.retransmit_delay);
+			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
+				uart_paired_cfg = cfg;
+				uart_paired_cfg_valid = true;
+				printk("PTX paired; wire PRX UART and press btn4 to sync\n");
+			}
+		}
+		break;
+	case UART_RC_ESB_CMD_SET_ADDR:
+		printk("ESB addresses staged\n");
+		break;
+	case UART_RC_ESB_CMD_APPLY:
+		printk("ESB radio applied\n");
+		break;
+	case UART_RC_ESB_CMD_SAVE:
+		printk("ESB config saved\n");
+		break;
+	default:
+		printk("ESB rsp cmd=0x%02x ok\n", rsp->cmd);
+		break;
+	}
+}
+
+static void on_uart_debug_log(const struct uart_rc_debug_log *log, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	printk("[ESB:%u] %.*s", log->level, log->text_len, log->text);
+	if ((log->flags & UART_RC_DEBUG_FLAG_MORE) == 0U) {
+		printk("\n");
+	}
+}
+
+static int uart_hub_send_esb_req(uint8_t cmd, const uint8_t *data, uint8_t data_len)
+{
+	struct uart_rc_esb_req req = {
+		.seq = uart_esb_req_seq++,
+		.cmd = cmd,
+		.data_len = data_len,
+	};
+
+	if (data_len > 0U && data != NULL) {
+		memcpy(req.data, data, data_len);
+	}
+
+	return uart_rc_link_send_esb_req(&uart_link, &req);
+}
+
+static int uart_hub_send_debug_ctrl(uint8_t flags, uint8_t level)
+{
+	struct uart_rc_debug_ctrl ctrl = {
+		.seq = uart_debug_ctrl_seq++,
+		.flags = flags,
+		.level = level,
+		.reserved = 0U,
+	};
+
+	return uart_rc_link_send_debug_ctrl(&uart_link, &ctrl);
+}
+
+static void uart_hub_query_esb_config(void)
+{
+	(void)uart_hub_send_esb_req(UART_RC_ESB_CMD_GET_CONFIG, NULL, 0U);
+}
+
+static int uart_hub_sync_esb_config(const struct uart_rc_esb_config *cfg)
+{
+	uint8_t addr_payload[16];
+	int err;
+
+	if (cfg == NULL) {
+		return -EINVAL;
+	}
+
+	memcpy(&addr_payload[0], cfg->base0, 4U);
+	memcpy(&addr_payload[4], cfg->base1, 4U);
+	memcpy(&addr_payload[8], cfg->prefixes, 8U);
+
+	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_SET_ADDR, addr_payload,
+				    sizeof(addr_payload));
+	if (err != 0) {
+		return err;
+	}
+
+	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_APPLY, NULL, 0U);
+	if (err != 0) {
+		return err;
+	}
+
+	return uart_hub_send_esb_req(UART_RC_ESB_CMD_SAVE, NULL, 0U);
+}
+
+static void uart_send_ctrl_from_state(const struct xbox_gamepad_state *s)
+{
+	struct uart_rc_link_ctrl ctrl = {
+		.seq = uart_ctrl_seq++,
+		.channel_count = UART_RC_CH_COUNT_DEFAULT,
+	};
+
+	ctrl.channels[UART_RC_CH_LX] = axis_to_rc(s->lx);
+	ctrl.channels[UART_RC_CH_LY] = axis_to_rc(s->ly);
+	ctrl.channels[UART_RC_CH_RX] = axis_to_rc(s->rx);
+	ctrl.channels[UART_RC_CH_RY] = axis_to_rc(s->ry);
+	ctrl.channels[UART_RC_CH_LT] = s->lt;
+	ctrl.channels[UART_RC_CH_RT] = s->rt;
+
+	(void)uart_rc_link_send_ctrl(&uart_link, &ctrl);
 }
 
 static int uart_link_init(void)
 {
-	uart_dev = DEVICE_DT_GET(DT_NODELABEL(uart30));
-	if (!device_is_ready(uart_dev)) {
-		return -ENODEV;
+	const struct device *uart = DEVICE_DT_GET(DT_NODELABEL(uart30));
+	struct uart_rc_link_handlers handlers = {
+		.on_ctrl = NULL,
+		.on_status = on_uart_status,
+		.on_esb_req = NULL,
+		.on_esb_rsp = on_uart_esb_rsp,
+		.on_debug_ctrl = NULL,
+		.on_debug_log = on_uart_debug_log,
+		.user_data = NULL,
+	};
+	int err;
+
+	err = uart_rc_link_init(&uart_link, uart, &handlers);
+	if (err != 0) {
+		return err;
 	}
 
-	uart_proto_reset();
-	uart_irq_callback_user_data_set(uart_dev, uart_isr, NULL);
-	uart_irq_rx_enable(uart_dev);
+	err = uart_rc_link_start_rx(&uart_link);
+	if (err != 0) {
+		return err;
+	}
 
+	printk("UART RC link on uart30 (HDLC 0x%02x)\n", UART_RC_LINK_HDLC_FLAG);
 	return 0;
 }
 
@@ -642,7 +640,7 @@ static void restart_scan(void)
 
 static int adv_start(void)
 {
-	int err = bt_le_adv_start(BT_LE_ADV_CONN,
+	int err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_2,
 				  adv_data, ARRAY_SIZE(adv_data),
 				  scan_rsp, ARRAY_SIZE(scan_rsp));
 
@@ -840,6 +838,25 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
 	uint32_t button = button_state & has_changed;
 
+	if (button & KEY_ESB_DEBUG_TOGGLE) {
+		uint8_t flags;
+
+		uart_debug_forward_enabled = !uart_debug_forward_enabled;
+		flags = uart_debug_forward_enabled ? UART_RC_DEBUG_FLAG_FORWARD : 0U;
+		(void)uart_hub_send_debug_ctrl(flags, LOG_LEVEL_INF);
+		printk("ESB debug forward %s\n", uart_debug_forward_enabled ? "on" : "off");
+	}
+
+	if (button & KEY_ESB_PAIR) {
+		if (uart_paired_cfg_valid) {
+			(void)uart_hub_sync_esb_config(&uart_paired_cfg);
+			printk("ESB config synced to UART device\n");
+		} else {
+			(void)uart_hub_send_esb_req(UART_RC_ESB_CMD_PAIR, NULL, 0U);
+			printk("ESB pair requested on PTX\n");
+		}
+	}
+
 	if (!auth_conn) {
 		return;
 	}
@@ -975,6 +992,8 @@ int main(void)
 		printk("UART link init failed: %d\n", err);
 		return 0;
 	}
+
+	uart_hub_query_esb_config();
 
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
 	k_work_schedule(&adv_guard_work, K_SECONDS(2));

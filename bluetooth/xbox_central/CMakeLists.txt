@@ -6,8 +6,11 @@ cmake_minimum_required(VERSION 3.20.0)
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(xbox_central)
 
+target_include_directories(app PRIVATE ../../esb/common)
+
 target_sources(app PRIVATE
   src/main.c
   src/xbox_report.c
   src/xbox_hids.c
+  ../../esb/common/uart_rc_link.c
 )

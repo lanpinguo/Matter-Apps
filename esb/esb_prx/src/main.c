@@ -27,14 +27,22 @@
 #endif /* defined(NRF54LM20A_ENGA_XXAA) */
 
 #include "rc_channel_bank.h"
+#include "rc_esb_radio.h"
 #include "rc_link.h"
 #include "rc_prx_channels.h"
+#include "rc_uart_bridge.h"
 
 LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
+
+#define KEY_RADIO_CLEAR            DK_BTN4_MSK
+#define RADIO_CLEAR_HOLD_TIME_MS  5000
 
 static uint8_t status_seq;
 static uint8_t last_ctrl_seq;
 static uint8_t peer_ctrl_channels;
+static bool pairing_mode;
+static bool radio_clear_armed;
+static struct k_work_delayable radio_clear_work;
 static struct esb_payload rx_payload;
 static struct esb_payload tx_payload;
 static struct rc_link_frame status_frame;
@@ -78,28 +86,102 @@ static int queue_status_payload(void)
 	return err;
 }
 
-static void handle_ctrl_frame(const struct esb_payload *payload)
+static void handle_pair_frame(const struct rc_link_frame *frame)
 {
-	struct rc_link_frame ctrl;
+	struct rc_link_pair_payload pair_payload;
 	int err;
 
-	err = rc_link_unpack(payload->data, payload->length, &ctrl);
-	if (err || ctrl.type != RC_LINK_TYPE_CTRL) {
-		LOG_DBG("Ignore invalid control frame: %d", err);
+	if (!pairing_mode) {
 		return;
 	}
 
-	last_ctrl_seq = ctrl.seq;
+	err = rc_link_pair_decode(frame, &pair_payload);
+	if (err != 0) {
+		LOG_DBG("Ignore invalid pair frame: %d", err);
+		return;
+	}
 
-	if (peer_ctrl_channels != ctrl.channel_count) {
-		peer_ctrl_channels = ctrl.channel_count;
+	err = rc_esb_radio_apply_pair_payload(&pair_payload, true);
+	if (err != 0) {
+		LOG_ERR("Pair apply/save failed: %d", err);
+		return;
+	}
+
+	pairing_mode = false;
+	LOG_INF("Paired from first valid pair frame and saved");
+}
+
+static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
+{
+	if (ctrl->type != RC_LINK_TYPE_CTRL) {
+		return;
+	}
+
+	last_ctrl_seq = ctrl->seq;
+
+	if (peer_ctrl_channels != ctrl->channel_count) {
+		peer_ctrl_channels = ctrl->channel_count;
 		LOG_INF("Controller channel count: %u", peer_ctrl_channels);
 	}
 
-	rc_link_log_channels("Control", &ctrl);
+	rc_link_log_channels("Control", ctrl);
 
-	if (ctrl.channel_count > 1U) {
-		leds_update((uint8_t)ctrl.channels[1]);
+	if (ctrl->channel_count > 1U) {
+		leds_update((uint8_t)ctrl->channels[1]);
+	}
+}
+
+static void handle_rx_frame(const struct esb_payload *payload)
+{
+	struct rc_link_frame frame;
+	int err;
+
+	err = rc_link_unpack(payload->data, payload->length, &frame);
+	if (err != 0) {
+		LOG_DBG("Ignore invalid RX frame: %d", err);
+		return;
+	}
+
+	if (frame.type == RC_LINK_TYPE_PAIR) {
+		handle_pair_frame(&frame);
+		return;
+	}
+
+	handle_ctrl_frame(&frame);
+}
+
+static void radio_clear_work_handler(struct k_work *work)
+{
+	int err;
+	ARG_UNUSED(work);
+
+	radio_clear_armed = false;
+
+	err = rc_esb_radio_clear_saved_config();
+	if (err != 0) {
+		LOG_ERR("Radio config clear failed: %d", err);
+		return;
+	}
+
+	pairing_mode = true;
+	LOG_INF("Radio config cleared, re-enter pair mode");
+}
+
+static void button_handler(uint32_t button_state, uint32_t has_changed)
+{
+	uint32_t changed = button_state & has_changed;
+
+	if ((changed & KEY_RADIO_CLEAR) == 0U) {
+		return;
+	}
+
+		if ((button_state & KEY_RADIO_CLEAR) != 0U) {
+		radio_clear_armed = true;
+		k_work_schedule(&radio_clear_work, K_MSEC(RADIO_CLEAR_HOLD_TIME_MS));
+		LOG_INF("Hold button %lu to clear radio config (5s)", (unsigned long)KEY_RADIO_CLEAR);
+	} else {
+		radio_clear_armed = false;
+		(void)k_work_cancel_delayable(&radio_clear_work);
 	}
 }
 
@@ -114,7 +196,7 @@ void event_handler(struct esb_evt const *event)
 		break;
 	case ESB_EVENT_RX_RECEIVED:
 		while (esb_read_rx_payload(&rx_payload) == 0) {
-			handle_ctrl_frame(&rx_payload);
+			handle_rx_frame(&rx_payload);
 		}
 		break;
 	default:
@@ -204,43 +286,12 @@ BUILD_ASSERT(false, "No Clock Control driver");
 
 int esb_initialize(void)
 {
-	int err;
-	uint8_t base_addr_0[4] = {0xE7, 0xE7, 0xE7, 0xE7};
-	uint8_t base_addr_1[4] = {0xC2, 0xC2, 0xC2, 0xC2};
-	uint8_t addr_prefix[8] = {0xE7, 0xC2, 0xC3, 0xC4, 0xC5, 0xC6, 0xC7, 0xC8};
-	struct esb_config config = ESB_DEFAULT_CONFIG;
+	return rc_esb_radio_init(event_handler);
+}
 
-	config.protocol = ESB_PROTOCOL_ESB_DPL;
-	config.bitrate = ESB_BITRATE_2MBPS;
-	config.mode = ESB_MODE_PRX;
-	config.event_handler = event_handler;
-	config.selective_auto_ack = true;
-	config.tx_output_power = 8;
-	if (IS_ENABLED(CONFIG_ESB_FAST_SWITCHING)) {
-		config.use_fast_ramp_up = true;
-	}
-
-	err = esb_init(&config);
-	if (err) {
-		return err;
-	}
-
-	err = esb_set_base_address_0(base_addr_0);
-	if (err) {
-		return err;
-	}
-
-	err = esb_set_base_address_1(base_addr_1);
-	if (err) {
-		return err;
-	}
-
-	err = esb_set_prefixes(addr_prefix, ARRAY_SIZE(addr_prefix));
-	if (err) {
-		return err;
-	}
-
-	return 0;
+static void on_radio_applied(void)
+{
+	(void)queue_status_payload();
 }
 
 int main(void)
@@ -250,6 +301,7 @@ int main(void)
 	LOG_INF("ESB receiver with bidirectional telemetry");
 
 	rc_prx_channels_bind_ctrl_seq(&last_ctrl_seq);
+	rc_esb_radio_set_applied_cb(on_radio_applied);
 
 	err = clocks_start();
 	if (err) {
@@ -262,26 +314,27 @@ int main(void)
 		return 0;
 	}
 
+	k_work_init_delayable(&radio_clear_work, radio_clear_work_handler);
+	radio_clear_armed = false;
+	dk_buttons_init(button_handler);
+
 	err = esb_initialize();
 	if (err) {
 		LOG_ERR("ESB initialization failed, err %d", err);
 		return 0;
 	}
+	pairing_mode = !rc_esb_radio_has_saved_config();
+
+	err = rc_uart_bridge_init();
+	if (err) {
+		LOG_ERR("UART bridge init failed, err %d", err);
+		return 0;
+	}
 
 	LOG_INF("Local status sources: %u (max)", (unsigned int)rc_prx_status_bank.slot_count);
-
-	err = queue_status_payload();
-	if (err) {
-		LOG_ERR("Initial status payload failed: %d", err);
-		return 0;
+	if (pairing_mode) {
+		LOG_INF("No saved radio config, waiting first pair frame");
 	}
-
-	err = esb_start_rx();
-	if (err) {
-		LOG_ERR("RX setup failed, err %d", err);
-		return 0;
-	}
-
 	LOG_INF("Listening for control frames");
 
 	return 0;

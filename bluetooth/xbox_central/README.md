@@ -63,18 +63,36 @@ Packed struct:
 
 - `param_id = 1`: set telemetry interval in milliseconds (`20..500`)
 
-## UART link to ESB module
+## UART link to ESB module (HUART-RC)
 
-Binary frame:
+Link layer uses **HDLC** framing (same style as OpenThread Spinel RCP):
 
-`magic(0xA6), type(1), len(1), payload(len), checksum_xor(1)`
+`0x7E | escaped( type | len | payload | fcs16_le ) | 0x7E`
 
-- `type=0x01` (Hub -> ESB control):
-  - `seq(1), channel_count(1), channels[channel_count]` (little-endian `u16`)
-  - Current channel_count is 6: `LX, LY, RX, RY, LT, RT`
-- `type=0x02` (ESB -> Hub status):
-  - Expected payload: `seq(1), roll(i16), pitch(i16), yaw(i16), batt(u16), flags(1)`
-  - Hub uses roll/pitch/yaw to update phone telemetry.
+- Flag: `0x7E`; escape: `0x7D` + `(byte ^ 0x20)` for `0x7E`/`0x7D`
+- FCS-16: PPP/HDLC CRC over `type | len | payload`, XOR `0xFFFF`, little-endian on wire
+- Full definition: `apps/esb/common/uart_rc_link.h`
+
+Wiring (nRF54L15 DK, 115200 baud):
+
+```text
+Hub uart30 TX  --->  ESB PTX uart20 RX
+Hub uart30 RX  <---  ESB PTX uart20 TX
+GND            <-->  GND
+```
+
+Message types (application payload inside HDLC):
+
+- `type=0x01` CTRL (Hub -> ESB): `seq(1), channel_count(1), channels[]` (LE u16)
+  - channel_count is 6: `LX, LY, RX, RY, LT, RT` (0..1000)
+- `type=0x02` STATUS (ESB -> Hub): `seq(1), roll(i16), pitch(i16), yaw(i16), batt(u16), flags(1)`
+- `type=0x03/0x04` ESB_REQ/RSP: radio config, pair, apply, save
+- `type=0x05/0x06` DEBUG_CTRL/LOG: Btn3 toggles log forwarding from ESB PTX
+
+Buttons:
+
+- **Btn3**: toggle ESB debug log forwarding to Hub console
+- **Btn4**: PAIR on PTX, or sync paired addresses to PRX (when pair data cached)
 
 ## Report format
 

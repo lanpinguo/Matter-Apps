@@ -1,0 +1,9 @@
+/*
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ *
+ * Match Ground BLE Hub uart30 speed for the wired RC link.
+ */
+
+&uart20 {
+	current-speed = <115200>;
+};
