@@ -36,8 +36,8 @@ Open a serial terminal at 115200 baud.
 1. Flash the DK and reset.
 2. Put the Xbox controller in pairing mode (hold the Sync button until the Xbox
    button blinks rapidly).
-3. When the DK shows a passkey, confirm on the controller and press **Button 1**
-   on the DK to accept (Button 2 to reject).
+3. The hub auto-confirms the BLE passkey; confirm on the controller if prompted.
+   Button 1 / Button 2 can still reject an in-progress manual pairing request.
 4. LED1 turns on when Xbox is connected. Move sticks and press buttons to see
    parsed values on the serial console.
 

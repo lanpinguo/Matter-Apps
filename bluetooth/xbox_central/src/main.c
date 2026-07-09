@@ -39,6 +39,16 @@
 #define TELEMETRY_MAX_INTERVAL_MS      500
 #define CONFIG_PARAM_TELEMETRY_MS      1
 #define SETTINGS_KEY_TELEMETRY_MS      "xbox_hub/telemetry_ms"
+#define SETTINGS_KEY_XBOX_ADDR         "xbox_hub/xbox_addr"
+
+/* Fast LE interval after connect (7.5–11.25 ms). */
+#define XBOX_CONN_INTERVAL_MIN           6U
+#define XBOX_CONN_INTERVAL_MAX           9U
+#define XBOX_CONN_LATENCY                0U
+#define XBOX_CONN_TIMEOUT                400U
+#define XBOX_SEC_RETRY_MAX               20U
+#define XBOX_SEC_RETRY_MS                100U
+#define XBOX_SCAN_RETRY_MS               2000U
 
 #define KEY_PAIRING_ACCEPT             DK_BTN1_MSK
 #define KEY_PAIRING_REJECT             DK_BTN2_MSK
@@ -84,6 +94,11 @@ static K_MUTEX_DEFINE(data_mutex);
 static struct k_work_delayable telemetry_work;
 static struct k_work_delayable adv_restart_work;
 static struct k_work_delayable adv_guard_work;
+static struct k_work_delayable xbox_sec_work;
+static struct k_work_delayable xbox_scan_retry_work;
+static struct bt_conn *xbox_sec_conn;
+static uint8_t xbox_sec_retries;
+static bool xbox_connecting;
 static uint8_t adv_restart_attempts;
 static bool adv_running;
 static struct uart_rc_link uart_link;
@@ -93,6 +108,9 @@ static uint8_t uart_debug_ctrl_seq;
 static bool uart_debug_forward_enabled;
 static struct uart_rc_esb_config uart_paired_cfg;
 static bool uart_paired_cfg_valid;
+static bt_addr_le_t bonded_xbox_addr;
+static bool bonded_xbox_valid;
+static bool xbox_input_logged;
 
 static ssize_t telemetry_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				 void *buf, uint16_t len, uint16_t offset);
@@ -126,6 +144,270 @@ static const struct bt_data scan_rsp[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
+
+static void restart_scan(void);
+static int adv_start(void);
+static void gatt_discover(struct bt_conn *conn);
+static void clear_xbox_bond(const struct bt_conn *conn);
+static void clear_bonded_xbox(void);
+static void phone_adv_pause(void);
+static void phone_adv_resume(void);
+static bool hub_may_phone_adv(void);
+static void schedule_xbox_scan_retry(uint32_t delay_ms);
+static void xbox_sec_work_cancel(void);
+static void xbox_request_security(struct bt_conn *conn);
+
+struct xbox_adv_name_ctx {
+	char name[32];
+	bool found;
+};
+
+#define XBOX_MS_COMPANY_ID             0x045EU
+#define XBOX_APPEARANCE_GAMEPAD        0x03C4U
+
+struct xbox_adv_parse_ctx {
+	struct xbox_adv_name_ctx name;
+	bool ms_mfg;
+	bool gamepad;
+	uint16_t appearance;
+};
+
+static bool xbox_adv_parse_cb(struct bt_data *data, void *user_data)
+{
+	struct xbox_adv_parse_ctx *ctx = user_data;
+
+	switch (data->type) {
+	case BT_DATA_NAME_COMPLETE:
+	case BT_DATA_NAME_SHORTENED:
+		if (data->data_len < sizeof(ctx->name.name)) {
+			memcpy(ctx->name.name, data->data, data->data_len);
+			ctx->name.name[data->data_len] = '\0';
+			ctx->name.found = true;
+		}
+		break;
+	case BT_DATA_MANUFACTURER_DATA:
+		if (data->data_len >= 2U &&
+		    sys_get_le16(data->data) == XBOX_MS_COMPANY_ID) {
+			ctx->ms_mfg = true;
+		}
+		break;
+	case BT_DATA_GAP_APPEARANCE:
+		if (data->data_len >= 2U) {
+			ctx->appearance = sys_get_le16(data->data);
+			if (ctx->appearance == XBOX_APPEARANCE_GAMEPAD) {
+				ctx->gamepad = true;
+			}
+		}
+		break;
+	default:
+		break;
+	}
+
+	return true;
+}
+
+static void xbox_log_adv_match(const char *addr, struct net_buf_simple *adv_data)
+{
+	struct xbox_adv_parse_ctx ctx = { 0 };
+
+	if (adv_data != NULL) {
+		bt_data_parse(adv_data, xbox_adv_parse_cb, &ctx);
+	}
+
+	if (ctx.name.found && strstr(ctx.name.name, "Xbox") != NULL) {
+		printk("Xbox controller found: %s ('%s')\n", addr, ctx.name.name);
+	} else if (ctx.ms_mfg) {
+		printk("Microsoft HID device found: %s\n", addr);
+	} else if (ctx.gamepad) {
+		printk("HID gamepad found: %s (appearance 0x%04x)\n", addr, ctx.appearance);
+	} else if (ctx.name.found) {
+		printk("HID UUID match: %s (name '%s')\n", addr, ctx.name.name);
+	} else {
+		printk("HID UUID match: %s (name likely in scan response)\n", addr);
+	}
+}
+
+static void xbox_sec_work_cancel(void)
+{
+	k_work_cancel_delayable(&xbox_sec_work);
+
+	if (xbox_sec_conn != NULL) {
+		bt_conn_unref(xbox_sec_conn);
+		xbox_sec_conn = NULL;
+	}
+
+	xbox_sec_retries = 0U;
+}
+
+static void xbox_sec_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	if (xbox_sec_conn == NULL) {
+		return;
+	}
+
+	if (bt_conn_get_security(xbox_sec_conn) >= BT_SECURITY_L2) {
+		xbox_sec_work_cancel();
+		return;
+	}
+
+	err = bt_conn_set_security(xbox_sec_conn, BT_SECURITY_L2);
+	if (err == 0) {
+		return;
+	}
+
+	printk("Xbox security request err %d (retry %u)\n", err, xbox_sec_retries);
+
+	if ((err == -EBUSY || err == -ENOMEM || err == -EAGAIN) &&
+	    ++xbox_sec_retries < XBOX_SEC_RETRY_MAX) {
+		k_work_schedule(&xbox_sec_work, K_MSEC(XBOX_SEC_RETRY_MS));
+		return;
+	}
+
+	clear_xbox_bond(xbox_sec_conn);
+	(void)bt_conn_disconnect(xbox_sec_conn, BT_HCI_ERR_AUTH_FAIL);
+	xbox_sec_work_cancel();
+}
+
+static void xbox_request_security(struct bt_conn *conn)
+{
+	xbox_sec_work_cancel();
+	xbox_sec_conn = bt_conn_ref(conn);
+
+	if (bt_conn_get_security(conn) >= BT_SECURITY_L2) {
+		gatt_discover(conn);
+		return;
+	}
+
+	k_work_schedule(&xbox_sec_work, K_NO_WAIT);
+}
+
+static void clear_xbox_bond(const struct bt_conn *conn)
+{
+	const bt_addr_le_t *dst = bt_conn_get_dst(conn);
+	char addr[BT_ADDR_LE_STR_LEN];
+	int err;
+
+	bt_addr_le_to_str(dst, addr, sizeof(addr));
+	err = bt_unpair(BT_ID_DEFAULT, dst);
+	if (err == 0) {
+		printk("Cleared bond for %s\n", addr);
+	} else if (err != -ENOENT) {
+		printk("Bond clear failed for %s: %d\n", addr, err);
+	}
+
+	if (bonded_xbox_valid && bt_addr_le_cmp(dst, &bonded_xbox_addr) == 0) {
+		bonded_xbox_valid = false;
+		(void)settings_delete(SETTINGS_KEY_XBOX_ADDR);
+	}
+}
+
+static void clear_bonded_xbox(void)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	if (!bonded_xbox_valid) {
+		printk("No bonded Xbox controller\n");
+		return;
+	}
+
+	bt_addr_le_to_str(&bonded_xbox_addr, addr, sizeof(addr));
+	(void)bt_unpair(BT_ID_DEFAULT, &bonded_xbox_addr);
+	bonded_xbox_valid = false;
+	(void)settings_delete(SETTINGS_KEY_XBOX_ADDR);
+	printk("Cleared bonded Xbox %s — hold Sync to pair again\n", addr);
+}
+
+static void phone_adv_pause(void)
+{
+	if (!adv_running || phone_conn != NULL) {
+		return;
+	}
+
+	k_work_cancel_delayable(&adv_restart_work);
+
+	if (bt_le_adv_stop() == 0) {
+		adv_running = false;
+		printk("Phone adv paused for Xbox link\n");
+	}
+}
+
+static bool hub_may_phone_adv(void)
+{
+	return phone_conn == NULL && default_conn == NULL && !xbox_connecting;
+}
+
+static void phone_adv_resume(void)
+{
+	if (!hub_may_phone_adv() || adv_running) {
+		return;
+	}
+
+	if (adv_start() == 0) {
+		printk("Phone adv resumed\n");
+	}
+}
+
+static void schedule_xbox_scan_retry(uint32_t delay_ms)
+{
+	k_work_cancel_delayable(&xbox_scan_retry_work);
+	k_work_schedule(&xbox_scan_retry_work, K_MSEC(delay_ms));
+}
+
+static void xbox_scan_retry_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (default_conn != NULL || xbox_connecting) {
+		return;
+	}
+
+	printk("Retrying Xbox scan\n");
+	restart_scan();
+}
+
+static void xbox_link_failed_retry(uint8_t hci_err)
+{
+	xbox_connecting = false;
+
+	if (hci_err == BT_HCI_ERR_CONN_FAIL_TO_ESTAB) {
+		printk("Xbox 0x3e — retry scan in %u ms (phone adv stays off)\n",
+		       XBOX_SCAN_RETRY_MS);
+		schedule_xbox_scan_retry(XBOX_SCAN_RETRY_MS);
+		return;
+	}
+
+	phone_adv_resume();
+	restart_scan();
+}
+
+static void bonded_xbox_store(const bt_addr_le_t *addr)
+{
+	if (addr == NULL) {
+		return;
+	}
+
+	bonded_xbox_addr = *addr;
+	bonded_xbox_valid = true;
+	(void)settings_save_one(SETTINGS_KEY_XBOX_ADDR, addr, sizeof(*addr));
+}
+
+static void log_bonded_xbox_boot(void)
+{
+	char addr[BT_ADDR_LE_STR_LEN];
+
+	if (!bonded_xbox_valid) {
+		printk("No bonded Xbox — first HID gamepad in range will be paired\n");
+		return;
+	}
+
+	bt_addr_le_to_str(&bonded_xbox_addr, addr, sizeof(addr));
+	printk("Bonded Xbox: %s (Hub ignores other controllers)\n", addr);
+	printk("Press Button 2 to forget and pair a different controller\n");
+}
 
 static void set_conn_led(bool on)
 {
@@ -468,6 +750,16 @@ static int settings_set_cb(const char *name, size_t len, settings_read_cb read_c
 			return 0;
 		}
 	}
+
+	if (strcmp(name, "xbox_addr") == 0 && len == sizeof(bonded_xbox_addr)) {
+		ssize_t rd = read_cb(cb_arg, &bonded_xbox_addr, sizeof(bonded_xbox_addr));
+
+		if (rd == sizeof(bonded_xbox_addr)) {
+			bonded_xbox_valid = true;
+			return 0;
+		}
+	}
+
 	return 0;
 }
 
@@ -497,6 +789,16 @@ static void input_report_cb(uint8_t report_id, const uint8_t *data,
 		return;
 	}
 
+	if (!xbox_input_logged && hids.conn != NULL) {
+		char addr[BT_ADDR_LE_STR_LEN];
+
+		bt_addr_le_to_str(bt_conn_get_dst(hids.conn), addr, sizeof(addr));
+		printk("Receiving Xbox input from %s\n", addr);
+		printk("Xbox link ready on %s — Sync LED should stop on THIS controller\n",
+		       addr);
+		xbox_input_logged = true;
+	}
+
 	k_mutex_lock(&data_mutex, K_FOREVER);
 	latest_state = state;
 	telemetry_update_from_state(&state);
@@ -514,20 +816,48 @@ static void scan_filter_match(struct bt_scan_device_info *device_info,
 			      bool connectable)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
+	struct bt_conn *conn = NULL;
+	int err;
 
 	if (!filter_match->uuid.match || (filter_match->uuid.count != 1)) {
 		return;
 	}
 
+	if (default_conn != NULL || xbox_connecting || !connectable) {
+		return;
+	}
+
+	if (bonded_xbox_valid &&
+	    bt_addr_le_cmp(device_info->recv_info->addr, &bonded_xbox_addr) != 0) {
+		return;
+	}
+
 	bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
-	printk("HID device found: %s connectable=%s\n", addr,
-	       connectable ? "yes" : "no");
+	xbox_log_adv_match(addr, device_info->adv_data);
+
+	xbox_connecting = true;
+	phone_adv_pause();
+	(void)bt_scan_stop();
+
+	err = bt_conn_le_create(device_info->recv_info->addr, BT_CONN_LE_CREATE_CONN,
+				device_info->conn_param, &conn);
+	if (err != 0) {
+		xbox_connecting = false;
+		printk("Xbox connect failed: %d\n", err);
+		phone_adv_resume();
+		restart_scan();
+		return;
+	}
+
+	default_conn = bt_conn_ref(conn);
+	bt_conn_unref(conn);
 }
 
 static void scan_connecting_error(struct bt_scan_device_info *device_info)
 {
 	ARG_UNUSED(device_info);
 	printk("Connection attempt failed\n");
+	xbox_link_failed_retry(BT_HCI_ERR_CONN_FAIL_TO_ESTAB);
 }
 
 static void scan_connecting(struct bt_scan_device_info *device_info,
@@ -548,9 +878,20 @@ static void scan_filter_no_match(struct bt_scan_device_info *device_info,
 		return;
 	}
 
+	if (default_conn != NULL || xbox_connecting) {
+		return;
+	}
+
+	if (bonded_xbox_valid &&
+	    bt_addr_le_cmp(device_info->recv_info->addr, &bonded_xbox_addr) != 0) {
+		return;
+	}
+
 	bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
 	printk("Direct advertising from %s\n", addr);
 	bt_scan_stop();
+	phone_adv_pause();
+	xbox_connecting = true;
 
 	err = bt_conn_le_create(device_info->recv_info->addr,
 				BT_CONN_LE_CREATE_CONN,
@@ -558,11 +899,25 @@ static void scan_filter_no_match(struct bt_scan_device_info *device_info,
 	if (!err) {
 		default_conn = bt_conn_ref(conn);
 		bt_conn_unref(conn);
+	} else {
+		xbox_connecting = false;
+		printk("Direct connect failed: %d\n", err);
+		xbox_link_failed_retry(BT_HCI_ERR_CONN_FAIL_TO_ESTAB);
 	}
 }
 
 BT_SCAN_CB_INIT(scan_cb, scan_filter_match, scan_filter_no_match,
 		scan_connecting_error, scan_connecting);
+
+static void xbox_activate_done_cb(int err, void *user_data)
+{
+	ARG_UNUSED(user_data);
+
+	if (err != 0) {
+		printk("HID activate failed: %d\n", err);
+		return;
+	}
+}
 
 static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 {
@@ -579,9 +934,9 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 		goto release_dm;
 	}
 
-	err = xbox_hids_subscribe_all(&hids);
+	err = xbox_hids_activate(&hids, xbox_activate_done_cb, NULL);
 	if (err) {
-		printk("HID subscribe failed: %d\n", err);
+		printk("HID activate start failed: %d\n", err);
 	}
 
 release_dm:
@@ -660,18 +1015,18 @@ static void adv_guard_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 
-	if (phone_conn == NULL) {
-		int err;
+	if (!hub_may_phone_adv()) {
+		k_work_schedule(&adv_guard_work, K_SECONDS(2));
+		return;
+	}
 
-		if (adv_running) {
-			k_work_schedule(&adv_guard_work, K_SECONDS(2));
-			return;
-		}
+	if (adv_running) {
+		k_work_schedule(&adv_guard_work, K_SECONDS(2));
+		return;
+	}
 
-		err = adv_start();
-		if (err) {
-			printk("Phone advertising guard failed: %d\n", err);
-		}
+	if (adv_start() != 0) {
+		printk("Phone advertising guard failed\n");
 	}
 
 	k_work_schedule(&adv_guard_work, K_SECONDS(2));
@@ -682,6 +1037,10 @@ static void adv_restart_work_handler(struct k_work *work)
 	int err;
 
 	ARG_UNUSED(work);
+
+	if (!hub_may_phone_adv()) {
+		return;
+	}
 
 	err = adv_start();
 	if (!err) {
@@ -712,8 +1071,8 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 		if (conn == default_conn) {
 			bt_conn_unref(default_conn);
 			default_conn = NULL;
-			restart_scan();
 		}
+		xbox_link_failed_retry(conn_err);
 		return;
 	}
 
@@ -727,12 +1086,11 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 	}
 
 	printk("Xbox connected: %s\n", addr);
+	xbox_connecting = false;
 	set_conn_led(true);
-
-	if (bt_conn_set_security(conn, BT_SECURITY_L2)) {
-		printk("Security request failed, starting discovery\n");
-		gatt_discover(conn);
-	}
+	(void)bt_scan_stop();
+	phone_adv_pause();
+	xbox_request_security(conn);
 }
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
@@ -761,12 +1119,13 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	       bt_hci_err_to_str(reason));
 	set_conn_led(false);
 	discovery_active = false;
+	xbox_sec_work_cancel();
 	xbox_hids_release(&hids);
 
 	if (default_conn == conn) {
 		bt_conn_unref(default_conn);
 		default_conn = NULL;
-		restart_scan();
+		xbox_link_failed_retry(reason);
 	}
 }
 
@@ -782,10 +1141,18 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 	} else {
 		printk("Security failed: %s level %u err %d %s\n", addr, level,
 		       err, bt_security_err_to_str(err));
+		if (err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING ||
+		    err == BT_SECURITY_ERR_AUTH_FAIL ||
+		    err == BT_SECURITY_ERR_KEY_REJECTED ||
+		    err == BT_SECURITY_ERR_UNSPECIFIED) {
+			clear_xbox_bond(conn);
+			(void)bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+		}
 		return;
 	}
 
 	if (level >= BT_SECURITY_L2) {
+		xbox_sec_work_cancel();
 		gatt_discover(conn);
 	}
 }
@@ -799,10 +1166,13 @@ BT_CONN_CB_DEFINE(conn_callbacks) = {
 static void scan_init(void)
 {
 	int err;
+	static const struct bt_le_conn_param xbox_conn_param =
+		BT_LE_CONN_PARAM_INIT(XBOX_CONN_INTERVAL_MIN, XBOX_CONN_INTERVAL_MAX,
+				      XBOX_CONN_LATENCY, XBOX_CONN_TIMEOUT);
 	struct bt_scan_init_param scan_init = {
-		.connect_if_match = 1,
+		.connect_if_match = 0,
 		.scan_param = NULL,
-		.conn_param = BT_LE_CONN_PARAM_DEFAULT,
+		.conn_param = &xbox_conn_param,
 	};
 
 	bt_scan_init(&scan_init);
@@ -857,16 +1227,28 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 		}
 	}
 
+	if (button & KEY_PAIRING_REJECT) {
+		if (auth_conn != NULL) {
+			num_comp_reply(false);
+		} else {
+			k_work_cancel_delayable(&xbox_scan_retry_work);
+			xbox_connecting = false;
+			clear_bonded_xbox();
+			if (default_conn != NULL) {
+				(void)bt_conn_disconnect(default_conn,
+							 BT_HCI_ERR_REMOTE_USER_TERM_CONN);
+			}
+			phone_adv_resume();
+			restart_scan();
+		}
+	}
+
 	if (!auth_conn) {
 		return;
 	}
 
 	if (button & KEY_PAIRING_ACCEPT) {
 		num_comp_reply(true);
-	}
-
-	if (button & KEY_PAIRING_REJECT) {
-		num_comp_reply(false);
 	}
 }
 
@@ -882,10 +1264,9 @@ static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
 
-	auth_conn = bt_conn_ref(conn);
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Confirm passkey for %s: %06u\n", addr, passkey);
-	printk("Press Button 1 to accept, Button 2 to reject.\n");
+	printk("Auto-confirm passkey for %s: %06u\n", addr, passkey);
+	(void)bt_conn_auth_passkey_confirm(conn);
 }
 
 static void auth_cancel(struct bt_conn *conn)
@@ -899,9 +1280,17 @@ static void auth_cancel(struct bt_conn *conn)
 static void pairing_complete(struct bt_conn *conn, bool bonded)
 {
 	char addr[BT_ADDR_LE_STR_LEN];
+	const bt_addr_le_t *dst = bt_conn_get_dst(conn);
 
-	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
+	bt_addr_le_to_str(dst, addr, sizeof(addr));
 	printk("Pairing complete: %s bonded=%d\n", addr, bonded);
+
+	if (bonded) {
+		bonded_xbox_store(dst);
+		printk("Hub bonded to %s — Sync LED on THIS controller should stop blinking\n",
+		       addr);
+		printk("If your controller still blinks, its MAC is different; press Button 2\n");
+	}
 }
 
 static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
@@ -911,6 +1300,19 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 	printk("Pairing failed: %s reason %d %s\n", addr, reason,
 	       bt_security_err_to_str(reason));
+
+	if (reason == BT_SECURITY_ERR_PIN_OR_KEY_MISSING ||
+	    reason == BT_SECURITY_ERR_AUTH_FAIL ||
+	    reason == BT_SECURITY_ERR_KEY_REJECTED ||
+	    reason == BT_SECURITY_ERR_UNSPECIFIED) {
+		clear_xbox_bond(conn);
+		(void)bt_conn_disconnect(conn, BT_HCI_ERR_AUTH_FAIL);
+	}
+
+	if (auth_conn == conn) {
+		bt_conn_unref(auth_conn);
+		auth_conn = NULL;
+	}
 }
 
 static struct bt_conn_auth_cb conn_auth_callbacks = {
@@ -935,6 +1337,8 @@ int main(void)
 	k_work_init_delayable(&telemetry_work, telemetry_work_handler);
 	k_work_init_delayable(&adv_restart_work, adv_restart_work_handler);
 	k_work_init_delayable(&adv_guard_work, adv_guard_work_handler);
+	k_work_init_delayable(&xbox_sec_work, xbox_sec_work_handler);
+	k_work_init_delayable(&xbox_scan_retry_work, xbox_scan_retry_handler);
 	memset(&latest_state, 0, sizeof(latest_state));
 	memset(&telemetry_data, 0, sizeof(telemetry_data));
 
@@ -960,6 +1364,7 @@ int main(void)
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_load();
 	}
+	log_bonded_xbox_boot();
 
 	scan_init();
 

@@ -6,9 +6,27 @@
 
 #include <string.h>
 
+#include <bluetooth/services/hids.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
 #include <zephyr/sys/printk.h>
+
+enum xbox_hids_activate_step {
+	XBOX_HIDS_ACTIVATE_REPORT_MAP,
+	XBOX_HIDS_ACTIVATE_DONE,
+};
+
+static struct {
+	struct xbox_hids *hids;
+	xbox_hids_ready_cb ready_cb;
+	void *user_data;
+	enum xbox_hids_activate_step step;
+	struct bt_gatt_read_params read_params;
+} activate_ctx;
+
+static uint8_t activate_read_cb(struct bt_conn *conn, uint8_t err,
+				struct bt_gatt_read_params *params,
+				const void *data, uint16_t length);
 
 static uint8_t notify_cb(struct bt_conn *conn,
 			 struct bt_gatt_subscribe_params *params,
@@ -129,6 +147,39 @@ int xbox_hids_setup(struct bt_gatt_dm *dm, struct xbox_hids *hids,
 			bt_gatt_dm_attr_chrc_val(chrc);
 		int err;
 
+		if (bt_uuid_cmp(chrc_val->uuid, BT_UUID_HIDS_INFO) == 0) {
+			uint16_t handle = chrc_value_handle_get(dm, chrc);
+
+			if (handle != 0U) {
+				hids->info_handle = handle;
+				hids->info_valid = true;
+				printk("Found HID information val=0x%04x\n", handle);
+			}
+			continue;
+		}
+
+		if (bt_uuid_cmp(chrc_val->uuid, BT_UUID_HIDS_REPORT_MAP) == 0) {
+			uint16_t handle = chrc_value_handle_get(dm, chrc);
+
+			if (handle != 0U) {
+				hids->report_map_handle = handle;
+				hids->report_map_valid = true;
+				printk("Found HID report map val=0x%04x\n", handle);
+			}
+			continue;
+		}
+
+		if (bt_uuid_cmp(chrc_val->uuid, BT_UUID_HIDS_CTRL_POINT) == 0) {
+			uint16_t handle = chrc_value_handle_get(dm, chrc);
+
+			if (handle != 0U) {
+				hids->ctrl_point_handle = handle;
+				hids->ctrl_point_valid = true;
+				printk("Found HID control point val=0x%04x\n", handle);
+			}
+			continue;
+		}
+
 		if (bt_uuid_cmp(chrc_val->uuid, BT_UUID_HIDS_REPORT)) {
 			continue;
 		}
@@ -183,9 +234,172 @@ int xbox_hids_subscribe_all(struct xbox_hids *hids)
 	return subscribed > 0 ? 0 : -EIO;
 }
 
+static void activate_finish(int err)
+{
+	struct xbox_hids *hids = activate_ctx.hids;
+	xbox_hids_ready_cb cb = activate_ctx.ready_cb;
+	void *user_data = activate_ctx.user_data;
+
+	memset(&activate_ctx, 0, sizeof(activate_ctx));
+
+	if (cb != NULL) {
+		cb(err, user_data);
+	}
+
+	ARG_UNUSED(hids);
+}
+
+static int activate_read_start(uint16_t handle, const char *label)
+{
+	int err;
+
+	if (handle == 0U) {
+		return -EINVAL;
+	}
+
+	activate_ctx.read_params.func = activate_read_cb;
+	activate_ctx.read_params.handle_count = 1;
+	activate_ctx.read_params.single.handle = handle;
+	activate_ctx.read_params.single.offset = 0;
+
+	err = bt_gatt_read(activate_ctx.hids->conn, &activate_ctx.read_params);
+	if (err != 0) {
+		printk("HID %s read start failed: %d\n", label, err);
+	}
+
+	return err;
+}
+
+static void activate_subscribe_finish(void)
+{
+	int err;
+
+	(void)xbox_hids_exit_suspend(activate_ctx.hids);
+	err = xbox_hids_subscribe_all(activate_ctx.hids);
+	if (err == 0) {
+		printk("HID activate done\n");
+	}
+	activate_finish(err);
+}
+
+static int activate_step_handle_get(uint16_t *handle, const char **label)
+{
+	switch (activate_ctx.step) {
+	case XBOX_HIDS_ACTIVATE_REPORT_MAP:
+		*label = "report map";
+		if (activate_ctx.hids->report_map_valid) {
+			*handle = activate_ctx.hids->report_map_handle;
+		}
+		break;
+	default:
+		*label = "characteristic";
+		break;
+	}
+
+	return (*handle != 0U) ? 0 : -ENOENT;
+}
+
+static uint8_t activate_read_cb(struct bt_conn *conn, uint8_t err,
+				struct bt_gatt_read_params *params,
+				const void *data, uint16_t length)
+{
+	const char *label = "characteristic";
+	uint16_t handle = 0U;
+	int rd_err;
+
+	ARG_UNUSED(conn);
+	ARG_UNUSED(params);
+	ARG_UNUSED(data);
+	ARG_UNUSED(length);
+
+	if (err != 0) {
+		printk("HID activate read step %u failed: %u\n", activate_ctx.step, err);
+	}
+
+	activate_ctx.step++;
+	while (activate_ctx.step < XBOX_HIDS_ACTIVATE_DONE) {
+		rd_err = activate_step_handle_get(&handle, &label);
+		if (rd_err == 0) {
+			return activate_read_start(handle, label) == 0 ?
+				BT_GATT_ITER_CONTINUE : BT_GATT_ITER_STOP;
+		}
+
+		activate_ctx.step++;
+	}
+
+	activate_subscribe_finish();
+	return BT_GATT_ITER_STOP;
+}
+
+static int activate_read_next(void)
+{
+	const char *label = "characteristic";
+	uint16_t handle = 0U;
+	int rd_err;
+
+	while (activate_ctx.step < XBOX_HIDS_ACTIVATE_DONE) {
+		rd_err = activate_step_handle_get(&handle, &label);
+		if (rd_err == 0) {
+			return activate_read_start(handle, label);
+		}
+
+		activate_ctx.step++;
+	}
+
+	activate_subscribe_finish();
+	return 0;
+}
+
+int xbox_hids_activate(struct xbox_hids *hids, xbox_hids_ready_cb cb, void *user_data)
+{
+	int err;
+
+	if (hids == NULL || hids->conn == NULL || hids->report_count == 0U) {
+		return -EINVAL;
+	}
+
+	if (activate_ctx.hids != NULL) {
+		return -EBUSY;
+	}
+
+	activate_ctx.hids = hids;
+	activate_ctx.ready_cb = cb;
+	activate_ctx.user_data = user_data;
+	activate_ctx.step = XBOX_HIDS_ACTIVATE_REPORT_MAP;
+
+	err = activate_read_next();
+	if (err != 0) {
+		activate_finish(err);
+	}
+
+	return err;
+}
+
+int xbox_hids_exit_suspend(struct xbox_hids *hids)
+{
+	uint8_t exit_suspend = BT_HIDS_CONTROL_POINT_EXIT_SUSPEND;
+	int err;
+
+	if (hids == NULL || !hids->conn || !hids->ctrl_point_valid) {
+		return 0;
+	}
+
+	err = bt_gatt_write_without_response(hids->conn, hids->ctrl_point_handle,
+					     &exit_suspend, sizeof(exit_suspend), false);
+	if (err != 0) {
+		printk("HID exit suspend failed: %d\n", err);
+	}
+
+	return err;
+}
+
 void xbox_hids_release(struct xbox_hids *hids)
 {
 	uint8_t i;
+
+	if (activate_ctx.hids == hids) {
+		memset(&activate_ctx, 0, sizeof(activate_ctx));
+	}
 
 	if (hids->conn) {
 		for (i = 0; i < hids->report_count; i++) {
