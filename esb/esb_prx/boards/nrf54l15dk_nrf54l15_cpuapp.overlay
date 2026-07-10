@@ -1,9 +1,114 @@
 /*
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  *
- * Match Ground BLE Hub uart30 speed for bench configuration.
+ * Console / Hub RC link on uart20: TX/RX only (no hardware flow control).
+ * Five RC PWM outputs on Port P1 (only domain that can drive PWM20/21/22).
+ *
+ * Pin map (nRF54L15 DK P1 header):
+ *   CH0 P1.11  CH1 P1.12  CH2 P1.06  CH3 P1.07  CH4 P1.10
  */
+
+&pinctrl {
+	uart20_default: uart20_default {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 4)>;
+		};
+
+		group2 {
+			psels = <NRF_PSEL(UART_RX, 1, 5)>;
+			bias-pull-up;
+		};
+	};
+
+	uart20_sleep: uart20_sleep {
+		group1 {
+			psels = <NRF_PSEL(UART_TX, 1, 4)>,
+				<NRF_PSEL(UART_RX, 1, 5)>;
+			low-power-enable;
+		};
+	};
+
+	pwm20_default: pwm20_default {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 11)>,
+				<NRF_PSEL(PWM_OUT1, 1, 12)>,
+				<NRF_PSEL(PWM_OUT2, 1, 6)>,
+				<NRF_PSEL(PWM_OUT3, 1, 7)>;
+		};
+	};
+
+	pwm20_sleep: pwm20_sleep {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 11)>,
+				<NRF_PSEL(PWM_OUT1, 1, 12)>,
+				<NRF_PSEL(PWM_OUT2, 1, 6)>,
+				<NRF_PSEL(PWM_OUT3, 1, 7)>;
+			low-power-enable;
+		};
+	};
+
+	pwm21_default: pwm21_default {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 10)>;
+		};
+	};
+
+	pwm21_sleep: pwm21_sleep {
+		group1 {
+			psels = <NRF_PSEL(PWM_OUT0, 1, 10)>;
+			low-power-enable;
+		};
+	};
+};
 
 &uart20 {
 	current-speed = <115200>;
+	pinctrl-0 = <&uart20_default>;
+	pinctrl-1 = <&uart20_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&pwm20 {
+	status = "okay";
+	pinctrl-0 = <&pwm20_default>;
+	pinctrl-1 = <&pwm20_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+&pwm21 {
+	status = "okay";
+	pinctrl-0 = <&pwm21_default>;
+	pinctrl-1 = <&pwm21_sleep>;
+	pinctrl-names = "default", "sleep";
+};
+
+/ {
+	rc_pwms {
+		compatible = "pwm-leds";
+
+		rc_pwm0: rc_pwm_0 {
+			pwms = <&pwm20 0 PWM_USEC(20000) PWM_POLARITY_NORMAL>;
+			label = "RC PWM CH0 (P1.11)";
+		};
+
+		rc_pwm1: rc_pwm_1 {
+			pwms = <&pwm20 1 PWM_USEC(20000) PWM_POLARITY_NORMAL>;
+			label = "RC PWM CH1 (P1.12)";
+		};
+
+		rc_pwm2: rc_pwm_2 {
+			pwms = <&pwm20 2 PWM_USEC(20000) PWM_POLARITY_NORMAL>;
+			label = "RC PWM CH2 (P1.06)";
+		};
+
+		rc_pwm3: rc_pwm_3 {
+			pwms = <&pwm20 3 PWM_USEC(20000) PWM_POLARITY_NORMAL>;
+			label = "RC PWM CH3 (P1.07)";
+		};
+
+		rc_pwm4: rc_pwm_4 {
+			pwms = <&pwm21 0 PWM_USEC(20000) PWM_POLARITY_NORMAL>;
+			label = "RC PWM CH4 (P1.10)";
+		};
+	};
 };

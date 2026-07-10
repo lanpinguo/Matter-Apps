@@ -30,6 +30,7 @@
 #include "rc_esb_radio.h"
 #include "rc_link.h"
 #include "rc_prx_channels.h"
+#include "rc_prx_pwm.h"
 #include "rc_uart_bridge.h"
 
 LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
@@ -159,6 +160,7 @@ static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
 	}
 
 	rc_link_log_channels("Control", ctrl);
+	rc_prx_pwm_apply_ctrl(ctrl);
 
 	if (ctrl->channel_count > 1U) {
 		leds_update((uint8_t)ctrl->channels[1]);
@@ -368,6 +370,12 @@ int main(void)
 	err = rc_uart_bridge_init();
 	if (err) {
 		LOG_ERR("UART bridge init failed, err %d", err);
+		return 0;
+	}
+
+	err = rc_prx_pwm_init();
+	if (err) {
+		LOG_ERR("RC PWM init failed, err %d", err);
 		return 0;
 	}
 

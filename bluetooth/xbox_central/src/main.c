@@ -37,6 +37,7 @@
 #define TELEMETRY_DEFAULT_INTERVAL_MS  50
 #define TELEMETRY_MIN_INTERVAL_MS      20
 #define TELEMETRY_MAX_INTERVAL_MS      500
+#define UART_CTRL_HEARTBEAT_MS         100
 #define CONFIG_PARAM_TELEMETRY_MS      1
 #define SETTINGS_KEY_TELEMETRY_MS      "xbox_hub/telemetry_ms"
 #define SETTINGS_KEY_XBOX_ADDR         "xbox_hub/xbox_addr"
@@ -161,6 +162,7 @@ static bool esb_pair_session_active;
 static struct k_work_delayable esb_ptx_hold_work;
 static struct k_work_delayable esb_debug_hold_work;
 static struct k_work_delayable esb_pair_watchdog_work;
+static struct k_work_delayable uart_ctrl_heartbeat_work;
 static bt_addr_le_t bonded_xbox_addr;
 static bool bonded_xbox_valid;
 static bool xbox_input_logged;
@@ -470,7 +472,8 @@ static void set_conn_led(bool on)
 
 static uint16_t axis_to_rc(int16_t axis)
 {
-	int32_t v = ((int32_t)axis + 32767) * 1000 / 65534;
+	/* Map int16 stick [-32768, 32767] → RC channel [0, 1000]. */
+	int32_t v = ((int32_t)axis + 32768) * 1000 / 65535;
 
 	if (v < 0) {
 		return 0U;
@@ -747,6 +750,26 @@ static void uart_send_ctrl_from_state(const struct xbox_gamepad_state *s)
 	ctrl.channels[UART_RC_CH_RT] = s->rt;
 
 	(void)uart_rc_link_send_ctrl(&uart_link, &ctrl);
+}
+
+static void uart_ctrl_heartbeat_handler(struct k_work *work)
+{
+	struct xbox_gamepad_state state;
+
+	ARG_UNUSED(work);
+
+	/*
+	 * Xbox may stop HID reports while sticks are idle. Keep UART CTRL
+	 * flowing so PTX/PRX do not hit link / PWM failsafe timeouts.
+	 */
+	if (hids.conn != NULL) {
+		k_mutex_lock(&data_mutex, K_FOREVER);
+		state = latest_state;
+		k_mutex_unlock(&data_mutex);
+		uart_send_ctrl_from_state(&state);
+	}
+
+	k_work_schedule(&uart_ctrl_heartbeat_work, K_MSEC(UART_CTRL_HEARTBEAT_MS));
 }
 
 static int uart_link_init(void)
@@ -1554,6 +1577,7 @@ int main(void)
 	k_work_init_delayable(&esb_ptx_hold_work, esb_ptx_hold_handler);
 	k_work_init_delayable(&esb_debug_hold_work, esb_debug_hold_handler);
 	k_work_init_delayable(&esb_pair_watchdog_work, esb_pair_watchdog_handler);
+	k_work_init_delayable(&uart_ctrl_heartbeat_work, uart_ctrl_heartbeat_handler);
 	memset(&latest_state, 0, sizeof(latest_state));
 	memset(&telemetry_data, 0, sizeof(telemetry_data));
 
@@ -1616,8 +1640,11 @@ int main(void)
 	uart_hub_query_esb_config();
 
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
+	k_work_schedule(&uart_ctrl_heartbeat_work, K_MSEC(UART_CTRL_HEARTBEAT_MS));
 	k_work_schedule(&adv_guard_work, K_SECONDS(2));
 	printk("Scanning Xbox, advertising to phone, UART link enabled\n");
+	printk("UART CTRL heartbeat %u ms while Xbox connected\n",
+	       UART_CTRL_HEARTBEAT_MS);
 	printk("Btn3: ESB PRX UART sync | Btn3 hold 1.5s: debug log | Btn4 hold 1.5s: ESB OTA pair\n");
 	return 0;
 }

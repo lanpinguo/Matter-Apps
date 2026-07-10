@@ -8,7 +8,7 @@
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/printk.h>
 
-#define STICK_CENTER 32767
+#define STICK_CENTER 32768
 
 static const char *dpad_name(uint8_t hat)
 {
@@ -56,10 +56,16 @@ bool xbox_report_parse(const uint8_t *data, uint8_t len,
 		return false;
 	}
 
-	out->lx = (int16_t)(sys_get_le16(&p[XBOX_OFF_LX]) - STICK_CENTER);
-	out->ly = (int16_t)(sys_get_le16(&p[XBOX_OFF_LY]) - STICK_CENTER);
-	out->rx = (int16_t)(sys_get_le16(&p[XBOX_OFF_RX]) - STICK_CENTER);
-	out->ry = (int16_t)(sys_get_le16(&p[XBOX_OFF_RY]) - STICK_CENTER);
+	/*
+	 * Stick axes are unsigned 0..65535 in the BLE report (center 32768).
+	 * Center with 32768 so the result fits int16 (-32768..32767). Using
+	 * 32767 made full-right (65535) become 32768, which overflows int16
+	 * to -32768 and maps both stick extremes to ~1 ms PWM.
+	 */
+	out->lx = (int16_t)((int32_t)sys_get_le16(&p[XBOX_OFF_LX]) - STICK_CENTER);
+	out->ly = (int16_t)((int32_t)sys_get_le16(&p[XBOX_OFF_LY]) - STICK_CENTER);
+	out->rx = (int16_t)((int32_t)sys_get_le16(&p[XBOX_OFF_RX]) - STICK_CENTER);
+	out->ry = (int16_t)((int32_t)sys_get_le16(&p[XBOX_OFF_RY]) - STICK_CENTER);
 	out->lt = sys_get_le16(&p[XBOX_OFF_LT]) & 0x03FFU;
 	out->rt = sys_get_le16(&p[XBOX_OFF_RT]) & 0x03FFU;
 	out->dpad = p[XBOX_OFF_DPAD] & 0x0FU;

@@ -87,6 +87,9 @@ Message types (application payload inside HDLC):
 
 - `type=0x01` CTRL (Hub -> ESB): `seq(1), channel_count(1), channels[]` (LE u16)
   - channel_count is 6: `LX, LY, RX, RY, LT, RT` (0..1000)
+  - While Xbox is connected, Hub also sends CTRL every **100 ms** (heartbeat) so
+    idle sticks still keep the ESB / PWM link alive; HID reports still push
+    immediate CTRL for low latency.
 - `type=0x02` STATUS (ESB -> Hub): `seq(1), roll(i16), pitch(i16), yaw(i16), batt(u16), flags(1)`
 - `type=0x03/0x04` ESB_REQ/RSP: radio config, pair, apply, save
 - `type=0x05/0x06` DEBUG_CTRL/LOG: Btn3 long press toggles log forwarding from ESB PTX

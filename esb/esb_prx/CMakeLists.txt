@@ -18,6 +18,7 @@ target_compile_definitions(app PRIVATE
 target_sources(app PRIVATE
   src/main.c
   src/rc_prx_channels.c
+  src/rc_prx_pwm.c
   src/rc_uart_bridge.c
   ../common/rc_link.c
   ../common/rc_channel_bank.c

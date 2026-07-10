@@ -8,10 +8,29 @@ Features
 
 * ESB PRX mode at 2 Mbps, receives control frames from PTX
 * Sends aircraft status back to PTX inside ACK payloads
+* Five RC PWM outputs (50 Hz, 1000–2000 µs) driven by CTRL channels 0–4
 * UART RC link on the **console UART** for ESB pair/config/save (bench setup)
 * Radio addresses persisted in flash (``esb_prx/radio`` settings key)
 * If no saved config exists, PRX enters auto-pair mode and accepts the first valid ESB ``PAIR`` frame
 * Pair with :file:`apps/esb/esb_ptx` for end-to-end testing
+
+PWM outputs (nRF54L15 DK Port P1)
+---------------------------------
+
+nRF54L15 PWM can only drive **GPIO Port P1**. Mapping (CTRL value 0..1000 → pulse):
+
+======= ====== ========================
+Channel Pin    Source (Hub / Xbox)
+======= ====== ========================
+CH0     P1.11  LX
+CH1     P1.12  LY
+CH2     P1.06  RX
+CH3     P1.07  RY
+CH4     P1.10  LT
+======= ====== ========================
+
+If no CTRL frame arrives for 500 ms, outputs go to failsafe (sticks center,
+CH4 low). ``uart20`` uses TX/RX only so P1.06/P1.07 are free for PWM.
 
 Pairing workflow
 ----------------
