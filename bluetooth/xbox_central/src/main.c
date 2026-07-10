@@ -99,6 +99,7 @@ static struct k_work_delayable xbox_scan_retry_work;
 static struct bt_conn *xbox_sec_conn;
 static uint8_t xbox_sec_retries;
 static bool xbox_connecting;
+static bool xbox_link_setup;
 static uint8_t adv_restart_attempts;
 static bool adv_running;
 static struct uart_rc_link uart_link;
@@ -138,11 +139,11 @@ static const uint8_t adv_uuid[] = {
 };
 static const struct bt_data adv_data[] = {
 	BT_DATA(BT_DATA_FLAGS, adv_flags, sizeof(adv_flags)),
-	BT_DATA(BT_DATA_UUID128_ALL, adv_uuid, sizeof(adv_uuid)),
-};
-static const struct bt_data scan_rsp[] = {
 	BT_DATA(BT_DATA_NAME_COMPLETE, CONFIG_BT_DEVICE_NAME,
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
+};
+static const struct bt_data scan_rsp[] = {
+	BT_DATA(BT_DATA_UUID128_ALL, adv_uuid, sizeof(adv_uuid)),
 };
 
 static void restart_scan(void);
@@ -337,7 +338,7 @@ static void phone_adv_pause(void)
 
 static bool hub_may_phone_adv(void)
 {
-	return phone_conn == NULL && default_conn == NULL && !xbox_connecting;
+	return phone_conn == NULL && !xbox_connecting && !xbox_link_setup;
 }
 
 static void phone_adv_resume(void)
@@ -372,10 +373,11 @@ static void xbox_scan_retry_handler(struct k_work *work)
 static void xbox_link_failed_retry(uint8_t hci_err)
 {
 	xbox_connecting = false;
+	xbox_link_setup = false;
 
 	if (hci_err == BT_HCI_ERR_CONN_FAIL_TO_ESTAB) {
-		printk("Xbox 0x3e — retry scan in %u ms (phone adv stays off)\n",
-		       XBOX_SCAN_RETRY_MS);
+		printk("Xbox 0x3e — retry scan in %u ms\n", XBOX_SCAN_RETRY_MS);
+		phone_adv_resume();
 		schedule_xbox_scan_retry(XBOX_SCAN_RETRY_MS);
 		return;
 	}
@@ -836,6 +838,7 @@ static void scan_filter_match(struct bt_scan_device_info *device_info,
 	xbox_log_adv_match(addr, device_info->adv_data);
 
 	xbox_connecting = true;
+	xbox_link_setup = true;
 	phone_adv_pause();
 	(void)bt_scan_stop();
 
@@ -843,6 +846,7 @@ static void scan_filter_match(struct bt_scan_device_info *device_info,
 				device_info->conn_param, &conn);
 	if (err != 0) {
 		xbox_connecting = false;
+		xbox_link_setup = false;
 		printk("Xbox connect failed: %d\n", err);
 		phone_adv_resume();
 		restart_scan();
@@ -890,8 +894,9 @@ static void scan_filter_no_match(struct bt_scan_device_info *device_info,
 	bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
 	printk("Direct advertising from %s\n", addr);
 	bt_scan_stop();
-	phone_adv_pause();
 	xbox_connecting = true;
+	xbox_link_setup = true;
+	phone_adv_pause();
 
 	err = bt_conn_le_create(device_info->recv_info->addr,
 				BT_CONN_LE_CREATE_CONN,
@@ -913,10 +918,15 @@ static void xbox_activate_done_cb(int err, void *user_data)
 {
 	ARG_UNUSED(user_data);
 
+	xbox_link_setup = false;
+
 	if (err != 0) {
 		printk("HID activate failed: %d\n", err);
-		return;
+	} else {
+		printk("Xbox HID ready — resuming phone advertising\n");
 	}
+
+	phone_adv_resume();
 }
 
 static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
@@ -937,6 +947,8 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 	err = xbox_hids_activate(&hids, xbox_activate_done_cb, NULL);
 	if (err) {
 		printk("HID activate start failed: %d\n", err);
+		xbox_link_setup = false;
+		phone_adv_resume();
 	}
 
 release_dm:
@@ -951,7 +963,9 @@ static void discovery_service_not_found_cb(struct bt_conn *conn, void *context)
 	ARG_UNUSED(conn);
 	ARG_UNUSED(context);
 	discovery_active = false;
+	xbox_link_setup = false;
 	printk("HID service not found\n");
+	phone_adv_resume();
 }
 
 static void discovery_error_found_cb(struct bt_conn *conn, int err, void *context)
@@ -959,7 +973,9 @@ static void discovery_error_found_cb(struct bt_conn *conn, int err, void *contex
 	ARG_UNUSED(conn);
 	ARG_UNUSED(context);
 	discovery_active = false;
+	xbox_link_setup = false;
 	printk("GATT discovery failed: %d\n", err);
+	phone_adv_resume();
 }
 
 static const struct bt_gatt_dm_cb discovery_cb = {
@@ -1087,6 +1103,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 
 	printk("Xbox connected: %s\n", addr);
 	xbox_connecting = false;
+	xbox_link_setup = true;
 	set_conn_led(true);
 	(void)bt_scan_stop();
 	phone_adv_pause();
@@ -1119,6 +1136,7 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 	       bt_hci_err_to_str(reason));
 	set_conn_led(false);
 	discovery_active = false;
+	xbox_link_setup = false;
 	xbox_sec_work_cancel();
 	xbox_hids_release(&hids);
 
@@ -1233,6 +1251,7 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 		} else {
 			k_work_cancel_delayable(&xbox_scan_retry_work);
 			xbox_connecting = false;
+			xbox_link_setup = false;
 			clear_bonded_xbox();
 			if (default_conn != NULL) {
 				(void)bt_conn_disconnect(default_conn,
