@@ -151,7 +151,7 @@ int rc_uart_log_fwd_apply(const struct uart_rc_debug_ctrl *ctrl)
 	forward_enabled = (ctrl->flags & UART_RC_DEBUG_FLAG_FORWARD) != 0U;
 	local_enabled = (ctrl->flags & UART_RC_DEBUG_FLAG_LOCAL) != 0U;
 
-	LOG_INF("Debug forward=%d local=%d level=%u", forward_enabled, local_enabled,
+	LOG_DBG("Debug forward=%d local=%d level=%u", forward_enabled, local_enabled,
 		ctrl->level);
 	return 0;
 }

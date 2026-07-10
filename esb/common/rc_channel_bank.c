@@ -74,10 +74,10 @@ void rc_link_log_channels(const char *prefix, const struct rc_link_frame *frame)
 		return;
 	}
 
-	LOG_INF("%s seq=%u count=%u flags=0x%02x", prefix, frame->seq,
+	LOG_DBG("%s seq=%u count=%u flags=0x%02x", prefix, frame->seq,
 		frame->channel_count, frame->flags);
 
 	for (uint8_t i = 0; i < frame->channel_count; i++) {
-		LOG_INF("  ch%u=%u", i, frame->channels[i]);
+		LOG_DBG("  ch%u=%u", i, frame->channels[i]);
 	}
 }

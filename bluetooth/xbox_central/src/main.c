@@ -52,8 +52,52 @@
 
 #define KEY_PAIRING_ACCEPT             DK_BTN1_MSK
 #define KEY_PAIRING_REJECT             DK_BTN2_MSK
-#define KEY_ESB_DEBUG_TOGGLE           DK_BTN3_MSK
-#define KEY_ESB_PAIR                   DK_BTN4_MSK
+#define KEY_ESB_PRX_PAIR               DK_BTN3_MSK
+#define KEY_ESB_PTX_PAIR               DK_BTN4_MSK
+#define ESB_BTN_HOLD_MS                1500
+#define ESB_PAIR_WATCHDOG_MS           32000
+
+static const char *uart_esb_cmd_name(uint8_t cmd)
+{
+	switch (cmd) {
+	case UART_RC_ESB_CMD_GET_CONFIG:
+		return "GET_CONFIG";
+	case UART_RC_ESB_CMD_SET_RADIO:
+		return "SET_RADIO";
+	case UART_RC_ESB_CMD_SET_ADDR:
+		return "SET_ADDR";
+	case UART_RC_ESB_CMD_PAIR:
+		return "PAIR";
+	case UART_RC_ESB_CMD_APPLY:
+		return "APPLY";
+	case UART_RC_ESB_CMD_SAVE:
+		return "SAVE";
+	default:
+		return "?";
+	}
+}
+
+static void uart_log_addr8(const char *label, const uint8_t *p, size_t n)
+{
+	printk("  %s:", label);
+	for (size_t i = 0; i < n; i++) {
+		printk(" %02x", p[i]);
+	}
+	printk("\n");
+}
+
+static void uart_log_esb_cfg(const struct uart_rc_esb_config *cfg)
+{
+	if (cfg == NULL) {
+		return;
+	}
+
+	printk("  radio: pipe=%u pwr=%d delay=%u bitrate=%u\n", cfg->pipe, cfg->tx_power,
+	       cfg->retransmit_delay, cfg->bitrate);
+	uart_log_addr8("base0", cfg->base0, sizeof(cfg->base0));
+	uart_log_addr8("base1", cfg->base1, sizeof(cfg->base1));
+	uart_log_addr8("prefix", cfg->prefixes, sizeof(cfg->prefixes));
+}
 
 #define HUB_UUID_W1 0x9350
 #define HUB_UUID_W2 0x11ed
@@ -109,6 +153,14 @@ static uint8_t uart_debug_ctrl_seq;
 static bool uart_debug_forward_enabled;
 static struct uart_rc_esb_config uart_paired_cfg;
 static bool uart_paired_cfg_valid;
+static bool esb_ptx_hold_armed;
+static bool esb_ptx_hold_fired;
+static bool esb_debug_hold_armed;
+static bool esb_debug_hold_fired;
+static bool esb_pair_session_active;
+static struct k_work_delayable esb_ptx_hold_work;
+static struct k_work_delayable esb_debug_hold_work;
+static struct k_work_delayable esb_pair_watchdog_work;
 static bt_addr_le_t bonded_xbox_addr;
 static bool bonded_xbox_valid;
 static bool xbox_input_logged;
@@ -439,6 +491,25 @@ static void on_uart_status(const struct uart_rc_link_status *status, void *user_
 	telemetry_data.yaw = status->yaw;
 	telemetry_data.flags |= BIT(1);
 	k_mutex_unlock(&data_mutex);
+
+	if (esb_pair_session_active) {
+		printk("[UART<-PTX] STATUS seq=%u flags=0x%02x batt=%u R/P/Y=%d/%d/%d\n",
+		       status->seq, status->flags, status->battery_mv, status->roll,
+		       status->pitch, status->yaw);
+	}
+}
+
+static void esb_pair_watchdog_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!esb_pair_session_active) {
+		return;
+	}
+
+	esb_pair_session_active = false;
+	printk("[PAIR] watchdog: no PTX pair-done within %d ms\n", ESB_PAIR_WATCHDOG_MS);
+	printk("[PAIR] check: PRX in pair mode? PTX UART logs above? ESB RF link?\n");
 }
 
 static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
@@ -447,8 +518,15 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 
 	ARG_UNUSED(user_data);
 
+	printk("[UART<-PTX] ESB_RSP seq=%u cmd=%s(0x%02x) status=%d data_len=%u\n",
+	       rsp->seq, uart_esb_cmd_name(rsp->cmd), rsp->cmd, rsp->status, rsp->data_len);
+
 	if (rsp->status != 0) {
-		printk("ESB rsp cmd=0x%02x failed: %d\n", rsp->cmd, rsp->status);
+		printk("[UART<-PTX] ESB_RSP FAILED\n");
+		if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
+			esb_pair_session_active = false;
+			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+		}
 		return;
 	}
 
@@ -457,37 +535,69 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 	case UART_RC_ESB_CMD_PAIR:
 		if (rsp->data_len >= sizeof(cfg) &&
 		    uart_rc_link_decode_esb_config(rsp->data, rsp->data_len, &cfg) == 0) {
-			printk("ESB cfg pipe=%u pwr=%d delay=%u\n", cfg.pipe, cfg.tx_power,
-			       cfg.retransmit_delay);
+			uart_paired_cfg = cfg;
+			uart_paired_cfg_valid = true;
+			uart_log_esb_cfg(&cfg);
 			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
-				uart_paired_cfg = cfg;
-				uart_paired_cfg_valid = true;
-				printk("PTX paired; wire PRX UART and press btn4 to sync\n");
+				printk("[PAIR] PTX accepted PAIR — waiting OTA PRX ACK (max 30s)\n");
+				printk("[PAIR] Ensure esb_prx is in pair mode "
+				       "(no saved cfg, or hold PRX Btn4 5s)\n");
+			}
+		} else {
+			printk("[UART<-PTX] ESB_RSP cfg decode failed (len=%u need=%u)\n",
+			       rsp->data_len, (unsigned int)sizeof(cfg));
+			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
+				esb_pair_session_active = false;
+				(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
 			}
 		}
 		break;
 	case UART_RC_ESB_CMD_SET_ADDR:
-		printk("ESB addresses staged\n");
+		printk("[UART<-PTX] addresses staged\n");
 		break;
 	case UART_RC_ESB_CMD_APPLY:
-		printk("ESB radio applied\n");
+		printk("[UART<-PTX] radio applied\n");
 		break;
 	case UART_RC_ESB_CMD_SAVE:
-		printk("ESB config saved\n");
+		printk("[UART<-PTX] config saved\n");
 		break;
 	default:
-		printk("ESB rsp cmd=0x%02x ok\n", rsp->cmd);
 		break;
 	}
 }
 
 static void on_uart_debug_log(const struct uart_rc_debug_log *log, void *user_data)
 {
+	char line[UART_RC_LINK_DEBUG_MAX_TEXT + 1];
+
 	ARG_UNUSED(user_data);
 
-	printk("[ESB:%u] %.*s", log->level, log->text_len, log->text);
+	printk("[PTX-LOG:%u] %.*s", log->level, log->text_len, log->text);
 	if ((log->flags & UART_RC_DEBUG_FLAG_MORE) == 0U) {
 		printk("\n");
+	}
+
+	/* PTX reports pair result via forwarded log lines. */
+	if (esb_pair_session_active && log->text_len > 0U) {
+		size_t n = (size_t)log->text_len;
+
+		if (n >= sizeof(line)) {
+			n = sizeof(line) - 1U;
+		}
+
+		memcpy(line, log->text, n);
+		line[n] = '\0';
+
+		if (strstr(line, "PRX ACK on PAIR") != NULL ||
+		    strstr(line, "PAIR broadcast ended") != NULL) {
+			esb_pair_session_active = false;
+			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+			printk("[PAIR] session complete (from PTX log)\n");
+		} else if (strstr(line, "PAIR broadcast timed out") != NULL) {
+			esb_pair_session_active = false;
+			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+			printk("[PAIR] session failed: PTX timed out waiting for PRX ACK\n");
+		}
 	}
 }
 
@@ -498,12 +608,20 @@ static int uart_hub_send_esb_req(uint8_t cmd, const uint8_t *data, uint8_t data_
 		.cmd = cmd,
 		.data_len = data_len,
 	};
+	int err;
 
 	if (data_len > 0U && data != NULL) {
 		memcpy(req.data, data, data_len);
 	}
 
-	return uart_rc_link_send_esb_req(&uart_link, &req);
+	printk("[UART->PTX] ESB_REQ seq=%u cmd=%s(0x%02x) data_len=%u\n",
+	       req.seq, uart_esb_cmd_name(cmd), cmd, data_len);
+
+	err = uart_rc_link_send_esb_req(&uart_link, &req);
+	if (err != 0) {
+		printk("[UART->PTX] ESB_REQ send failed: %d\n", err);
+	}
+	return err;
 }
 
 static int uart_hub_send_debug_ctrl(uint8_t flags, uint8_t level)
@@ -548,6 +666,70 @@ static int uart_hub_sync_esb_config(const struct uart_rc_esb_config *cfg)
 	}
 
 	return uart_hub_send_esb_req(UART_RC_ESB_CMD_SAVE, NULL, 0U);
+}
+
+static void uart_hub_trigger_esb_ptx_pair(void)
+{
+	int err;
+
+	uart_paired_cfg_valid = false;
+	esb_pair_session_active = true;
+
+	/* Stream PTX pair logs to Hub console during the session. */
+	uart_debug_forward_enabled = true;
+	err = uart_hub_send_debug_ctrl(UART_RC_DEBUG_FLAG_FORWARD, LOG_LEVEL_WRN);
+	printk("[PAIR] enable PTX log forward (err=%d)\n", err);
+
+	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_PAIR, NULL, 0U);
+	if (err != 0) {
+		esb_pair_session_active = false;
+		printk("[PAIR] ESB_REQ PAIR send failed (err %d)\n", err);
+		return;
+	}
+
+	(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+	k_work_schedule(&esb_pair_watchdog_work, K_MSEC(ESB_PAIR_WATCHDOG_MS));
+	printk("[PAIR] waiting for PTX ESB_RSP + OTA PRX ACK...\n");
+}
+
+static void uart_hub_trigger_esb_prx_pair(void)
+{
+	int err;
+
+	if (!uart_paired_cfg_valid) {
+		printk("No PTX pair data — press Btn4 (pair PTX) first\n");
+		return;
+	}
+
+	err = uart_hub_sync_esb_config(&uart_paired_cfg);
+	if (err != 0) {
+		printk("ESB PRX pair/sync failed (err %d)\n", err);
+		return;
+	}
+
+	printk("ESB PRX pair/sync started (SET_ADDR/APPLY/SAVE on UART device)\n");
+}
+
+static void esb_ptx_hold_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	esb_ptx_hold_fired = true;
+	uart_hub_trigger_esb_ptx_pair();
+}
+
+static void esb_debug_hold_handler(struct k_work *work)
+{
+	uint8_t flags;
+
+	ARG_UNUSED(work);
+
+	esb_debug_hold_fired = true;
+	uart_debug_forward_enabled = !uart_debug_forward_enabled;
+	flags = uart_debug_forward_enabled ? UART_RC_DEBUG_FLAG_FORWARD : 0U;
+	(void)uart_hub_send_debug_ctrl(flags, LOG_LEVEL_INF);
+	printk("ESB debug forward %s (Btn3 long press)\n",
+	       uart_debug_forward_enabled ? "on" : "off");
 }
 
 static void uart_send_ctrl_from_state(const struct xbox_gamepad_state *s)
@@ -1226,22 +1408,33 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
 	uint32_t button = button_state & has_changed;
 
-	if (button & KEY_ESB_DEBUG_TOGGLE) {
-		uint8_t flags;
-
-		uart_debug_forward_enabled = !uart_debug_forward_enabled;
-		flags = uart_debug_forward_enabled ? UART_RC_DEBUG_FLAG_FORWARD : 0U;
-		(void)uart_hub_send_debug_ctrl(flags, LOG_LEVEL_INF);
-		printk("ESB debug forward %s\n", uart_debug_forward_enabled ? "on" : "off");
+	/* Btn4 long press 1.5s = ESB PTX/PRX OTA pair (short press ignored). */
+	if (button & KEY_ESB_PTX_PAIR) {
+		if ((button_state & KEY_ESB_PTX_PAIR) != 0U) {
+			esb_ptx_hold_armed = true;
+			esb_ptx_hold_fired = false;
+			k_work_schedule(&esb_ptx_hold_work, K_MSEC(ESB_BTN_HOLD_MS));
+		} else {
+			(void)k_work_cancel_delayable(&esb_ptx_hold_work);
+			esb_ptx_hold_armed = false;
+		}
 	}
 
-	if (button & KEY_ESB_PAIR) {
-		if (uart_paired_cfg_valid) {
-			(void)uart_hub_sync_esb_config(&uart_paired_cfg);
-			printk("ESB config synced to UART device\n");
+	/*
+	 * Btn3: short press = UART sync addresses to PRX;
+	 * long press 1.5s = toggle ESB debug log forward.
+	 */
+	if (button & KEY_ESB_PRX_PAIR) {
+		if ((button_state & KEY_ESB_PRX_PAIR) != 0U) {
+			esb_debug_hold_armed = true;
+			esb_debug_hold_fired = false;
+			k_work_schedule(&esb_debug_hold_work, K_MSEC(ESB_BTN_HOLD_MS));
 		} else {
-			(void)uart_hub_send_esb_req(UART_RC_ESB_CMD_PAIR, NULL, 0U);
-			printk("ESB pair requested on PTX\n");
+			(void)k_work_cancel_delayable(&esb_debug_hold_work);
+			if (esb_debug_hold_armed && !esb_debug_hold_fired) {
+				uart_hub_trigger_esb_prx_pair();
+			}
+			esb_debug_hold_armed = false;
 		}
 	}
 
@@ -1358,6 +1551,9 @@ int main(void)
 	k_work_init_delayable(&adv_guard_work, adv_guard_work_handler);
 	k_work_init_delayable(&xbox_sec_work, xbox_sec_work_handler);
 	k_work_init_delayable(&xbox_scan_retry_work, xbox_scan_retry_handler);
+	k_work_init_delayable(&esb_ptx_hold_work, esb_ptx_hold_handler);
+	k_work_init_delayable(&esb_debug_hold_work, esb_debug_hold_handler);
+	k_work_init_delayable(&esb_pair_watchdog_work, esb_pair_watchdog_handler);
 	memset(&latest_state, 0, sizeof(latest_state));
 	memset(&telemetry_data, 0, sizeof(telemetry_data));
 
@@ -1422,5 +1618,6 @@ int main(void)
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
 	k_work_schedule(&adv_guard_work, K_SECONDS(2));
 	printk("Scanning Xbox, advertising to phone, UART link enabled\n");
+	printk("Btn3: ESB PRX UART sync | Btn3 hold 1.5s: debug log | Btn4 hold 1.5s: ESB OTA pair\n");
 	return 0;
 }

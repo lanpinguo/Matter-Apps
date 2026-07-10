@@ -10,6 +10,7 @@
 #include <string.h>
 
 #include <zephyr/drivers/uart.h>
+#include <zephyr/kernel.h>
 #include <zephyr/sys/byteorder.h>
 
 uint16_t uart_rc_link_hdlc_fcs16(const uint8_t *buf, size_t len)
@@ -80,14 +81,145 @@ static int uart_rc_link_hdlc_send(struct uart_rc_link *link, const uint8_t *data
 	return 0;
 }
 
+struct uart_rc_link_rx_msg {
+	struct uart_rc_link *link;
+	uint8_t type;
+	union {
+		struct uart_rc_link_ctrl ctrl;
+		struct uart_rc_link_status status;
+		struct uart_rc_esb_req esb_req;
+		struct uart_rc_esb_rsp esb_rsp;
+		struct uart_rc_debug_ctrl debug_ctrl;
+		struct uart_rc_debug_log debug_log;
+	} u;
+};
+
+#define UART_RC_LINK_RX_MSGQ_LEN 8U
+
+K_MSGQ_DEFINE(uart_rc_link_rx_msgq, sizeof(struct uart_rc_link_rx_msg),
+	      UART_RC_LINK_RX_MSGQ_LEN, 4);
+
+static struct k_work uart_rc_link_rx_work;
+static bool uart_rc_link_rx_work_inited;
+
+static void uart_rc_link_rx_work_handler(struct k_work *work)
+{
+	struct uart_rc_link_rx_msg msg;
+
+	ARG_UNUSED(work);
+
+	while (k_msgq_get(&uart_rc_link_rx_msgq, &msg, K_NO_WAIT) == 0) {
+		struct uart_rc_link *link = msg.link;
+		const struct uart_rc_link_handlers *handlers = &link->handlers;
+		void *user_data = handlers->user_data;
+
+		switch (msg.type) {
+		case UART_RC_LINK_TYPE_CTRL:
+			if (handlers->on_ctrl != NULL) {
+				handlers->on_ctrl(&msg.u.ctrl, user_data);
+			}
+			break;
+		case UART_RC_LINK_TYPE_STATUS:
+			if (handlers->on_status != NULL) {
+				handlers->on_status(&msg.u.status, user_data);
+			}
+			break;
+		case UART_RC_LINK_TYPE_ESB_REQ:
+			if (handlers->on_esb_req != NULL) {
+				handlers->on_esb_req(&msg.u.esb_req, user_data);
+			}
+			break;
+		case UART_RC_LINK_TYPE_ESB_RSP:
+			if (handlers->on_esb_rsp != NULL) {
+				handlers->on_esb_rsp(&msg.u.esb_rsp, user_data);
+			}
+			break;
+		case UART_RC_LINK_TYPE_DEBUG_CTRL:
+			if (handlers->on_debug_ctrl != NULL) {
+				handlers->on_debug_ctrl(&msg.u.debug_ctrl, user_data);
+			}
+			break;
+		case UART_RC_LINK_TYPE_DEBUG_LOG:
+			if (handlers->on_debug_log != NULL) {
+				handlers->on_debug_log(&msg.u.debug_log, user_data);
+			}
+			break;
+		default:
+			break;
+		}
+	}
+
+	if (k_msgq_num_used_get(&uart_rc_link_rx_msgq) > 0U) {
+		(void)k_work_submit(&uart_rc_link_rx_work);
+	}
+}
+
+static void uart_rc_link_rx_work_ensure_init(void)
+{
+	if (!uart_rc_link_rx_work_inited) {
+		k_work_init(&uart_rc_link_rx_work, uart_rc_link_rx_work_handler);
+		uart_rc_link_rx_work_inited = true;
+	}
+}
+
+static bool uart_rc_link_rx_enqueue(struct uart_rc_link *link, uint8_t type,
+				    const uint8_t *payload, size_t payload_len)
+{
+	struct uart_rc_link_rx_msg msg = {
+		.link = link,
+		.type = type,
+	};
+	int err;
+
+	uart_rc_link_rx_work_ensure_init();
+
+	switch (type) {
+	case UART_RC_LINK_TYPE_CTRL:
+		if (uart_rc_link_decode_ctrl(payload, payload_len, &msg.u.ctrl) != 0) {
+			return false;
+		}
+		break;
+	case UART_RC_LINK_TYPE_STATUS:
+		if (uart_rc_link_decode_status(payload, payload_len, &msg.u.status) != 0) {
+			return false;
+		}
+		break;
+	case UART_RC_LINK_TYPE_ESB_REQ:
+		if (uart_rc_link_decode_esb_req(payload, payload_len, &msg.u.esb_req) != 0) {
+			return false;
+		}
+		break;
+	case UART_RC_LINK_TYPE_ESB_RSP:
+		if (uart_rc_link_decode_esb_rsp(payload, payload_len, &msg.u.esb_rsp) != 0) {
+			return false;
+		}
+		break;
+	case UART_RC_LINK_TYPE_DEBUG_CTRL:
+		if (uart_rc_link_decode_debug_ctrl(payload, payload_len,
+						 &msg.u.debug_ctrl) != 0) {
+			return false;
+		}
+		break;
+	case UART_RC_LINK_TYPE_DEBUG_LOG:
+		if (uart_rc_link_decode_debug_log(payload, payload_len, &msg.u.debug_log) != 0) {
+			return false;
+		}
+		break;
+	default:
+		return false;
+	}
+
+	err = k_msgq_put(&uart_rc_link_rx_msgq, &msg, K_NO_WAIT);
+	if (err != 0) {
+		return false;
+	}
+
+	(void)k_work_submit(&uart_rc_link_rx_work);
+	return true;
+}
+
 static void uart_rc_link_dispatch(struct uart_rc_link *link)
 {
-	struct uart_rc_link_ctrl ctrl;
-	struct uart_rc_link_status status;
-	struct uart_rc_esb_req esb_req;
-	struct uart_rc_esb_rsp esb_rsp;
-	struct uart_rc_debug_ctrl debug_ctrl;
-	struct uart_rc_debug_log debug_log;
 	uint8_t type;
 	uint8_t len;
 	uint16_t rx_fcs;
@@ -116,29 +248,20 @@ static void uart_rc_link_dispatch(struct uart_rc_link *link)
 
 	payload = &link->rx_raw[2];
 
-	if (type == UART_RC_LINK_TYPE_CTRL && link->handlers.on_ctrl != NULL &&
-	    uart_rc_link_decode_ctrl(payload, len, &ctrl) == 0) {
-		link->handlers.on_ctrl(&ctrl, link->handlers.user_data);
-	} else if (type == UART_RC_LINK_TYPE_STATUS &&
-		   link->handlers.on_status != NULL &&
-		   uart_rc_link_decode_status(payload, len, &status) == 0) {
-		link->handlers.on_status(&status, link->handlers.user_data);
-	} else if (type == UART_RC_LINK_TYPE_ESB_REQ &&
-		   link->handlers.on_esb_req != NULL &&
-		   uart_rc_link_decode_esb_req(payload, len, &esb_req) == 0) {
-		link->handlers.on_esb_req(&esb_req, link->handlers.user_data);
-	} else if (type == UART_RC_LINK_TYPE_ESB_RSP &&
-		   link->handlers.on_esb_rsp != NULL &&
-		   uart_rc_link_decode_esb_rsp(payload, len, &esb_rsp) == 0) {
-		link->handlers.on_esb_rsp(&esb_rsp, link->handlers.user_data);
-	} else if (type == UART_RC_LINK_TYPE_DEBUG_CTRL &&
-		   link->handlers.on_debug_ctrl != NULL &&
-		   uart_rc_link_decode_debug_ctrl(payload, len, &debug_ctrl) == 0) {
-		link->handlers.on_debug_ctrl(&debug_ctrl, link->handlers.user_data);
-	} else if (type == UART_RC_LINK_TYPE_DEBUG_LOG &&
-		   link->handlers.on_debug_log != NULL &&
-		   uart_rc_link_decode_debug_log(payload, len, &debug_log) == 0) {
-		link->handlers.on_debug_log(&debug_log, link->handlers.user_data);
+	if (link->handlers.on_ctrl != NULL && type == UART_RC_LINK_TYPE_CTRL) {
+		(void)uart_rc_link_rx_enqueue(link, type, payload, len);
+	} else if (link->handlers.on_status != NULL && type == UART_RC_LINK_TYPE_STATUS) {
+		(void)uart_rc_link_rx_enqueue(link, type, payload, len);
+	} else if (link->handlers.on_esb_req != NULL && type == UART_RC_LINK_TYPE_ESB_REQ) {
+		(void)uart_rc_link_rx_enqueue(link, type, payload, len);
+	} else if (link->handlers.on_esb_rsp != NULL && type == UART_RC_LINK_TYPE_ESB_RSP) {
+		(void)uart_rc_link_rx_enqueue(link, type, payload, len);
+	} else if (link->handlers.on_debug_ctrl != NULL &&
+		   type == UART_RC_LINK_TYPE_DEBUG_CTRL) {
+		(void)uart_rc_link_rx_enqueue(link, type, payload, len);
+	} else if (link->handlers.on_debug_log != NULL &&
+		   type == UART_RC_LINK_TYPE_DEBUG_LOG) {
+		(void)uart_rc_link_rx_enqueue(link, type, payload, len);
 	}
 }
 

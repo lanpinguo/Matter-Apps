@@ -29,7 +29,6 @@
 #include "rc_channel_bank.h"
 #include "rc_esb_radio.h"
 #include "rc_link.h"
-#include "rc_ptx_channels.h"
 #include "rc_ptx_uart_channels.h"
 #include "rc_uart_bridge.h"
 
@@ -47,7 +46,17 @@ static struct esb_payload tx_payload;
 static struct rc_link_frame ctrl_frame;
 static int64_t next_pair_tx_ms;
 static bool pending_pair_restore;
+static bool pair_probe_pending;
 static struct uart_rc_esb_config saved_paired_cfg;
+
+static void pair_complete(const char *reason)
+{
+	pending_pair_restore = false;
+	pair_probe_pending = false;
+	(void)rc_esb_radio_apply_cfg(&saved_paired_cfg);
+	rc_esb_radio_end_pair_broadcast();
+	LOG_WRN("%s — enter UART CTRL forward", reason);
+}
 
 static void restore_paired_radio_cfg(void)
 {
@@ -83,29 +92,75 @@ static void handle_status_frame(const struct esb_payload *payload)
 
 	if (peer_status_channels != status.channel_count) {
 		peer_status_channels = status.channel_count;
-		LOG_INF("Aircraft status channel count: %u", peer_status_channels);
+		LOG_DBG("Aircraft status channel count: %u", peer_status_channels);
 	}
 
-	rc_link_log_channels("Telemetry", &status);
 	rc_uart_bridge_on_esb_status(&status);
 }
 
 void event_handler(struct esb_evt const *event)
 {
+	static uint16_t pair_tx_ok;
+	static uint16_t pair_tx_fail;
+
 	ready = true;
 
 	switch (event->evt_id) {
 	case ESB_EVENT_TX_SUCCESS:
-		restore_paired_radio_cfg();
-		LOG_DBG("Control frame sent");
+		if (rc_esb_radio_pair_broadcast_active()) {
+			if (pending_pair_restore) {
+				/* ACK on default listen address. */
+				pair_tx_ok++;
+				restore_paired_radio_cfg();
+				pair_complete("PRX ACK on PAIR");
+				LOG_WRN("pair stats ok=%u fail=%u", pair_tx_ok, pair_tx_fail);
+				pair_tx_ok = 0;
+				pair_tx_fail = 0;
+			} else if (pair_probe_pending) {
+				/*
+				 * ACK on the new paired address — PRX already
+				 * applied even if the default-addr ACK was lost.
+				 */
+				pair_probe_pending = false;
+				pair_complete("PRX reachable on new addr");
+				pair_tx_ok = 0;
+				pair_tx_fail = 0;
+			} else {
+				restore_paired_radio_cfg();
+			}
+		} else {
+			restore_paired_radio_cfg();
+			LOG_DBG("Control frame sent");
+		}
 		break;
 	case ESB_EVENT_TX_FAILED:
-		restore_paired_radio_cfg();
-		LOG_DBG("Control frame failed");
+		if (pending_pair_restore && rc_esb_radio_pair_broadcast_active()) {
+			pair_tx_fail++;
+			LOG_WRN("PAIR TX no ACK (fail=%u) — probe new addr next",
+				pair_tx_fail);
+			restore_paired_radio_cfg();
+			/* PRX may already have paired; probe on new addresses. */
+			pair_probe_pending = true;
+			pending_pair_restore = false;
+		} else if (pair_probe_pending && rc_esb_radio_pair_broadcast_active()) {
+			LOG_WRN("New-addr probe no ACK — resume PAIR broadcast");
+			pair_probe_pending = false;
+		} else {
+			restore_paired_radio_cfg();
+			LOG_DBG("Control/PAIR frame failed");
+		}
 		break;
 	case ESB_EVENT_RX_RECEIVED:
 		while (esb_read_rx_payload(&rx_payload) == 0) {
 			handle_status_frame(&rx_payload);
+		}
+		/*
+		 * STATUS on the new address during pair window also proves PRX
+		 * applied the paired config.
+		 */
+		if (rc_esb_radio_pair_broadcast_active() && !pending_pair_restore) {
+			pair_probe_pending = false;
+			pair_complete("STATUS RX on new addr");
 		}
 		break;
 	default:
@@ -246,9 +301,7 @@ int main(void)
 {
 	int err;
 
-	LOG_INF("ESB transmitter with bidirectional telemetry");
-
-	rc_ptx_channels_bind_seq(&ctrl_seq);
+	LOG_WRN("ESB PTX ready (UART RC forward; Btn4 PAIR until PRX ACK)");
 
 	err = clocks_start();
 	if (err) {
@@ -273,9 +326,7 @@ int main(void)
 		return 0;
 	}
 
-	LOG_INF("Local control sources: %u", (unsigned int)rc_ptx_control_bank.slot_count);
-	LOG_INF("Sending control frames every %d ms", TX_INTERVAL_MS);
-	next_pair_tx_ms = k_uptime_get();
+	next_pair_tx_ms = 0;
 
 	while (1) {
 		if (ready) {
@@ -283,8 +334,25 @@ int main(void)
 			esb_flush_tx();
 
 			struct uart_rc_esb_config paired_cfg;
+			const bool pair_window = rc_esb_radio_pair_broadcast_active();
 
-			if (k_uptime_get() >= next_pair_tx_ms) {
+			if (pair_window && pair_probe_pending) {
+				/*
+				 * After a lost default-addr ACK, PRX may already be on
+				 * the new addresses. Probe there before more PAIR TX.
+				 */
+				(void)rc_esb_radio_get_config(&paired_cfg);
+				saved_paired_cfg = paired_cfg;
+				err = pack_pair_payload(&tx_payload);
+				if (err) {
+					LOG_ERR("Pack probe frame failed: %d", err);
+					pair_probe_pending = false;
+					ready = true;
+					continue;
+				}
+				pending_pair_restore = false;
+				LOG_WRN("Probe TX on new paired addr (len=%u)", tx_payload.length);
+			} else if (pair_window && k_uptime_get() >= next_pair_tx_ms) {
 				next_pair_tx_ms = k_uptime_get() + PAIR_TX_INTERVAL_MS;
 
 				(void)rc_esb_radio_get_config(&paired_cfg);
@@ -303,9 +371,20 @@ int main(void)
 				}
 				saved_paired_cfg = paired_cfg;
 				pending_pair_restore = true;
-			} else {
+				pair_probe_pending = false;
+				LOG_WRN("PAIR TX on default addr (seq payload len=%u)",
+					tx_payload.length);
+			} else if (!pair_window) {
+				const struct rc_channel_bank *bank =
+					rc_ptx_get_active_control_bank();
+
+				if (bank == NULL) {
+					ready = true;
+					continue;
+				}
+
 				err = rc_link_frame_fill(&ctrl_frame, RC_LINK_TYPE_CTRL, ctrl_seq++, 0,
-							 rc_ptx_get_active_control_bank());
+							 bank);
 				if (err) {
 					LOG_ERR("Prepare control frame failed: %d", err);
 					ready = true;
@@ -317,6 +396,10 @@ int main(void)
 				}
 
 				err = pack_ctrl_payload(&tx_payload);
+			} else {
+				/* Pair window active but waiting for next PAIR slot. */
+				ready = true;
+				continue;
 			}
 			if (err) {
 				LOG_ERR("Pack TX frame failed: %d", err);

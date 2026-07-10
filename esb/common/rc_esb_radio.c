@@ -9,6 +9,7 @@
 #include <errno.h>
 #include <string.h>
 
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
 #include <zephyr/settings/settings.h>
@@ -41,6 +42,9 @@ static rc_esb_radio_applied_cb_t applied_cb;
 static bool staged_valid;
 static bool has_saved_config;
 static bool esb_has_been_initialized;
+static int64_t pair_broadcast_until_ms;
+
+#define RC_ESB_PAIR_BROADCAST_MS 30000U
 
 static void rc_esb_radio_defaults(struct uart_rc_esb_config *cfg)
 {
@@ -253,7 +257,7 @@ int rc_esb_radio_pair(struct uart_rc_esb_config *out_cfg)
 		*out_cfg = staged_cfg;
 	}
 
-	LOG_INF("Generated new ESB pairing addresses");
+	LOG_DBG("Generated new ESB pairing addresses");
 	return 0;
 }
 
@@ -321,6 +325,41 @@ int rc_esb_radio_apply_pair_listen(void)
 	rc_esb_radio_defaults(&listen_cfg);
 
 	return rc_esb_radio_hw_apply(&listen_cfg);
+}
+
+void rc_esb_radio_begin_pair_broadcast(uint32_t duration_ms)
+{
+	if (duration_ms == 0U) {
+		duration_ms = RC_ESB_PAIR_BROADCAST_MS;
+	}
+
+	pair_broadcast_until_ms = k_uptime_get() + (int64_t)duration_ms;
+	LOG_WRN("PAIR broadcast up to %u ms (ends early on PRX ACK)", duration_ms);
+}
+
+void rc_esb_radio_end_pair_broadcast(void)
+{
+	if (pair_broadcast_until_ms == 0) {
+		return;
+	}
+
+	pair_broadcast_until_ms = 0;
+	LOG_WRN("PAIR broadcast ended — UART CTRL forward mode");
+}
+
+bool rc_esb_radio_pair_broadcast_active(void)
+{
+	if (pair_broadcast_until_ms == 0) {
+		return false;
+	}
+
+	if (k_uptime_get() >= pair_broadcast_until_ms) {
+		pair_broadcast_until_ms = 0;
+		LOG_WRN("PAIR broadcast timed out — UART CTRL forward mode");
+		return false;
+	}
+
+	return true;
 }
 
 int rc_esb_radio_clear_saved_config(void)
@@ -433,8 +472,12 @@ int rc_esb_radio_handle_req(const struct uart_rc_esb_req *req,
 			err = rc_esb_radio_apply();
 		}
 		if (err == 0) {
+			err = rc_esb_radio_save();
+		}
+		if (err == 0) {
 			rsp->data_len = (uint8_t)sizeof(cfg);
 			memcpy(rsp->data, &cfg, sizeof(cfg));
+			rc_esb_radio_begin_pair_broadcast(RC_ESB_PAIR_BROADCAST_MS);
 		}
 		break;
 	case UART_RC_ESB_CMD_APPLY:
@@ -449,5 +492,7 @@ int rc_esb_radio_handle_req(const struct uart_rc_esb_req *req,
 	}
 
 	rsp->status = (int8_t)((err == 0) ? 0 : err);
+	LOG_WRN("ESB req cmd=0x%02x -> status=%d data_len=%u", req->cmd, rsp->status,
+		rsp->data_len);
 	return 0;
 }

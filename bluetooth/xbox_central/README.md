@@ -73,13 +73,15 @@ Link layer uses **HDLC** framing (same style as OpenThread Spinel RCP):
 - FCS-16: PPP/HDLC CRC over `type | len | payload`, XOR `0xFFFF`, little-endian on wire
 - Full definition: `apps/esb/common/uart_rc_link.h`
 
-Wiring (nRF54L15 DK, 115200 baud):
+Wiring (nRF54L15 DK, 115200 baud, **TX/RX/GND only — no RTS/CTS**):
 
 ```text
-Hub uart30 TX  --->  ESB PTX uart20 RX
-Hub uart30 RX  <---  ESB PTX uart20 TX
-GND            <-->  GND
+Hub uart30 TX (P0.00)  --->  ESB PTX uart20 RX (P1.05)
+Hub uart30 RX (P0.01)  <---  ESB PTX uart20 TX (P1.04)
+GND                    <-->  GND
 ```
+
+Hardware flow control is not used; HDLC framing handles reliability at 115200.
 
 Message types (application payload inside HDLC):
 
@@ -87,12 +89,17 @@ Message types (application payload inside HDLC):
   - channel_count is 6: `LX, LY, RX, RY, LT, RT` (0..1000)
 - `type=0x02` STATUS (ESB -> Hub): `seq(1), roll(i16), pitch(i16), yaw(i16), batt(u16), flags(1)`
 - `type=0x03/0x04` ESB_REQ/RSP: radio config, pair, apply, save
-- `type=0x05/0x06` DEBUG_CTRL/LOG: Btn3 toggles log forwarding from ESB PTX
+- `type=0x05/0x06` DEBUG_CTRL/LOG: Btn3 long press toggles log forwarding from ESB PTX
 
 Buttons:
 
-- **Btn3**: toggle ESB debug log forwarding to Hub console
-- **Btn4**: PAIR on PTX, or sync paired addresses to PRX (when pair data cached)
+- **Btn4** hold 1.5 s: ``PAIR`` on **esb_ptx** — generate/save addresses and broadcast OTA PAIR
+  until **esb_prx** ACKs (max 30 s; PRX must be in pair mode)
+- **Btn3** short press: optional UART sync of cached addresses to **esb_prx** (rewire Hub UART)
+- **Btn3** hold 1.5 s: toggle ESB debug log forwarding to Hub console
+
+OTA pair checklist: PRX in pair mode → Hub UART to PTX → hold Btn4 1.5s → wait for PRX
+``Paired from first valid pair frame``.
 
 ## Report format
 

@@ -16,12 +16,19 @@ Features
 Pairing workflow
 ----------------
 
-PTX and PRX must use the **same ESB addresses**.
+PTX and PRX must use the **same ESB addresses**. Preferred path is **OTA**:
 
-1. Wire Hub ``uart30`` to PTX console UART, press Hub **button 4** to ``PAIR`` the transmitter.
-2. Rewire Hub UART to PRX console UART, press Hub **button 4** again to ``SET_ADDR`` /
-   ``APPLY`` / ``SAVE`` the paired addresses on the receiver.
-3. Remove the bench UART wire; airborne link uses ESB only.
+1. Put PRX in pair mode (no saved ``esb_prx/radio``, or hold PRX **button 4** for 5 s).
+2. Wire Hub ``uart30`` to PTX console UART, hold Hub **button 4** for 1.5 s.
+3. PTX generates addresses, saves them, and broadcasts ESB ``PAIR`` on the
+   default listen address until PRX ACKs (max 30 s). PRX accepts the first
+   valid frame, saves, and PTX switches to UART CTRL forward immediately.
+4. Remove the bench UART wire if desired; airborne link uses ESB only.
+
+Alternate bench path (UART sync to PRX):
+
+1. Press Hub **button 4** while wired to PTX (caches addresses on Hub).
+2. Rewire Hub UART to PRX, press Hub **button 3** to ``SET_ADDR`` / ``APPLY`` / ``SAVE``.
 
 Radio clear (long press)
 -------------------------

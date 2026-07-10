@@ -77,7 +77,7 @@ int rc_uart_bridge_init(void)
 		return err;
 	}
 
-	LOG_INF("UART RC link on console (HDLC 0x%02x, multiplexed with logs)",
+	LOG_DBG("UART RC link on console (HDLC 0x%02x, multiplexed with logs)",
 		UART_RC_LINK_HDLC_FLAG);
 	return 0;
 }

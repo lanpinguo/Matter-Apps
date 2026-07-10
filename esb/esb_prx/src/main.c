@@ -43,9 +43,15 @@ static uint8_t peer_ctrl_channels;
 static bool pairing_mode;
 static bool radio_clear_armed;
 static struct k_work_delayable radio_clear_work;
+static struct k_work_delayable pair_apply_work;
+static struct rc_link_pair_payload pending_pair_payload;
+static bool pending_pair_valid;
 static struct esb_payload rx_payload;
 static struct esb_payload tx_payload;
 static struct rc_link_frame status_frame;
+
+/* Leave enough time for ESB ACK on the default address before switching. */
+#define PAIR_APPLY_DELAY_MS 100
 
 static void leds_update(uint8_t value)
 {
@@ -86,12 +92,35 @@ static int queue_status_payload(void)
 	return err;
 }
 
+static void pair_apply_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	if (!pending_pair_valid) {
+		return;
+	}
+
+	pending_pair_valid = false;
+	err = rc_esb_radio_apply_pair_payload(&pending_pair_payload, true);
+	if (err != 0) {
+		LOG_ERR("Pair apply/save failed: %d", err);
+		pairing_mode = true;
+		return;
+	}
+
+	pairing_mode = false;
+	LOG_WRN("Paired from first valid pair frame and saved");
+}
+
 static void handle_pair_frame(const struct rc_link_frame *frame)
 {
 	struct rc_link_pair_payload pair_payload;
 	int err;
 
 	if (!pairing_mode) {
+		LOG_DBG("Ignore PAIR (not in pair mode)");
 		return;
 	}
 
@@ -101,14 +130,19 @@ static void handle_pair_frame(const struct rc_link_frame *frame)
 		return;
 	}
 
-	err = rc_esb_radio_apply_pair_payload(&pair_payload, true);
-	if (err != 0) {
-		LOG_ERR("Pair apply/save failed: %d", err);
+	/*
+	 * Delay address switch so the ESB ACK for this PAIR frame completes on
+	 * the default listen address. k_work_submit was ~1ms and broke PTX ACK.
+	 */
+	if (pending_pair_valid) {
 		return;
 	}
 
+	pending_pair_payload = pair_payload;
+	pending_pair_valid = true;
 	pairing_mode = false;
-	LOG_INF("Paired from first valid pair frame and saved");
+	LOG_WRN("PAIR frame RX — apply in %d ms (after ACK)", PAIR_APPLY_DELAY_MS);
+	(void)k_work_schedule(&pair_apply_work, K_MSEC(PAIR_APPLY_DELAY_MS));
 }
 
 static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
@@ -315,6 +349,7 @@ int main(void)
 	}
 
 	k_work_init_delayable(&radio_clear_work, radio_clear_work_handler);
+	k_work_init_delayable(&pair_apply_work, pair_apply_work_handler);
 	radio_clear_armed = false;
 	dk_buttons_init(button_handler);
 
@@ -324,6 +359,11 @@ int main(void)
 		return 0;
 	}
 	pairing_mode = !rc_esb_radio_has_saved_config();
+	if (pairing_mode) {
+		LOG_WRN("No saved radio config — pair mode ON (waiting ESB PAIR)");
+	} else {
+		LOG_WRN("Saved radio config loaded — pair mode OFF (hold Btn4 5s to clear)");
+	}
 
 	err = rc_uart_bridge_init();
 	if (err) {
@@ -332,9 +372,6 @@ int main(void)
 	}
 
 	LOG_INF("Local status sources: %u (max)", (unsigned int)rc_prx_status_bank.slot_count);
-	if (pairing_mode) {
-		LOG_INF("No saved radio config, waiting first pair frame");
-	}
 	LOG_INF("Listening for control frames");
 
 	return 0;

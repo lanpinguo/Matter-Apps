@@ -9,8 +9,6 @@
 #include <zephyr/kernel.h>
 #include <zephyr/sys/util.h>
 
-#include "rc_ptx_channels.h"
-
 static uint16_t uart_channel_values[UART_RC_LINK_MAX_CHANNELS];
 static size_t uart_channel_count;
 static int64_t uart_last_update_ms;
@@ -68,11 +66,11 @@ bool rc_ptx_uart_channels_active(void)
 
 const struct rc_channel_bank *rc_ptx_get_active_control_bank(void)
 {
-	if (rc_ptx_uart_channels_active()) {
-		return &uart_bank;
+	if (!rc_ptx_uart_channels_active()) {
+		return NULL;
 	}
 
-	return &rc_ptx_control_bank;
+	return &uart_bank;
 }
 
 static int rc_ptx_uart_channels_init(void)

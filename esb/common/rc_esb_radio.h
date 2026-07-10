@@ -35,6 +35,12 @@ int rc_esb_radio_apply_pair_listen(void);
 int rc_esb_radio_clear_saved_config(void);
 int rc_esb_radio_apply(void);
 int rc_esb_radio_save(void);
+
+/** Start / query / end OTA PAIR broadcast window (PTX sends PAIR on default address). */
+void rc_esb_radio_begin_pair_broadcast(uint32_t duration_ms);
+void rc_esb_radio_end_pair_broadcast(void);
+bool rc_esb_radio_pair_broadcast_active(void);
+
 int rc_esb_radio_handle_req(const struct uart_rc_esb_req *req,
 			    struct uart_rc_esb_rsp *rsp);
 

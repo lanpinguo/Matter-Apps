@@ -10,6 +10,6 @@ menu "Enhanced ShockBurst: Transmitter"
 
 config ESB_PTX_APP_LOG_LEVEL
 	int "Log level for the ESB PTX sample"
-	default 4
+	default 2
 
 endmenu

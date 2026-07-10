@@ -20,6 +20,8 @@
  * When debug forwarding is enabled (TYPE_DEBUG_CTRL), logs are sent as
  * TYPE_DEBUG_LOG binary frames instead of plain text on the wire.
  *
+ * Handler callbacks are invoked from the system workqueue (not UART ISR).
+ *
  * Link layer (HDLC, same style as OpenThread Spinel RCP)
  * ------------------------------------------------------
  * On wire:
