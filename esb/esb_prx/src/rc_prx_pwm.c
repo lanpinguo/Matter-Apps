@@ -10,6 +10,8 @@
 #include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
+#include "uart_rc_link.h"
+
 LOG_MODULE_REGISTER(rc_prx_pwm, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
 #define RC_PWM_PERIOD_NS    PWM_USEC(20000)
@@ -18,7 +20,19 @@ LOG_MODULE_REGISTER(rc_prx_pwm, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 #define RC_PWM_VALUE_MAX    1000U
 #define RC_PWM_FAILSAFE_MS  500U
 
-/* Stick channels failsafe to center; channel 4 (LT) fails to low. */
+/*
+ * PWM output i reads CTRL channel pwm_ctrl_index[i].
+ * CH4 (P1.10) is throttle from Xbox RT.
+ */
+static const uint8_t pwm_ctrl_index[RC_PRX_PWM_CHANNEL_COUNT] = {
+	UART_RC_CH_LX,
+	UART_RC_CH_LY,
+	UART_RC_CH_RX,
+	UART_RC_CH_RY,
+	UART_RC_CH_RT,
+};
+
+/* Stick PWMs failsafe to center; throttle (RT) fails to low. */
 static const uint16_t failsafe_values[RC_PRX_PWM_CHANNEL_COUNT] = {
 	500U, 500U, 500U, 500U, 0U,
 };
@@ -45,7 +59,26 @@ static uint32_t value_to_pulse_ns(uint16_t value)
 	return RC_PWM_PULSE_MIN_NS + ((span * (uint32_t)value) / RC_PWM_VALUE_MAX);
 }
 
-static void set_channel(uint8_t index, uint16_t value)
+/*
+ * Sticks arrive as 0..1000. Xbox triggers are still raw 10-bit (0..1023)
+ * from the Hub — normalize them here before PWM mapping.
+ */
+static uint16_t normalize_ctrl_value(uint8_t ctrl_index, uint16_t value)
+{
+	if (ctrl_index == UART_RC_CH_LT || ctrl_index == UART_RC_CH_RT) {
+		if (value > 1023U) {
+			value = 1023U;
+		}
+		return (uint16_t)((value * RC_PWM_VALUE_MAX) / 1023U);
+	}
+
+	if (value > RC_PWM_VALUE_MAX) {
+		value = RC_PWM_VALUE_MAX;
+	}
+	return value;
+}
+
+static void set_pwm(uint8_t index, uint16_t value)
 {
 	int err;
 	uint32_t pulse_ns;
@@ -61,16 +94,23 @@ static void set_channel(uint8_t index, uint16_t value)
 	}
 }
 
-static void apply_values(const uint16_t *values, uint8_t count)
+static void apply_failsafe(void)
 {
-	uint8_t n = MIN(count, RC_PRX_PWM_CHANNEL_COUNT);
-
-	for (uint8_t i = 0; i < n; i++) {
-		set_channel(i, values[i]);
+	for (uint8_t i = 0; i < RC_PRX_PWM_CHANNEL_COUNT; i++) {
+		set_pwm(i, failsafe_values[i]);
 	}
+}
 
-	for (uint8_t i = n; i < RC_PRX_PWM_CHANNEL_COUNT; i++) {
-		set_channel(i, failsafe_values[i]);
+static void apply_ctrl_channels(const uint16_t *channels, uint8_t count)
+{
+	for (uint8_t i = 0; i < RC_PRX_PWM_CHANNEL_COUNT; i++) {
+		uint8_t src = pwm_ctrl_index[i];
+
+		if (src < count) {
+			set_pwm(i, normalize_ctrl_value(src, channels[src]));
+		} else {
+			set_pwm(i, failsafe_values[i]);
+		}
 	}
 }
 
@@ -78,7 +118,7 @@ static void failsafe_work_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
 	LOG_WRN("CTRL timeout — PWM failsafe");
-	apply_values(failsafe_values, RC_PRX_PWM_CHANNEL_COUNT);
+	apply_failsafe();
 }
 
 int rc_prx_pwm_init(void)
@@ -92,8 +132,8 @@ int rc_prx_pwm_init(void)
 
 	k_work_init_delayable(&failsafe_work, failsafe_work_handler);
 	pwm_ready = true;
-	apply_values(failsafe_values, RC_PRX_PWM_CHANNEL_COUNT);
-	LOG_INF("RC PWM ready: %u ch @ 50 Hz (1000-2000 us)", RC_PRX_PWM_CHANNEL_COUNT);
+	apply_failsafe();
+	LOG_INF("RC PWM ready: %u ch @ 50 Hz (CH4=RT throttle)", RC_PRX_PWM_CHANNEL_COUNT);
 	return 0;
 }
 
@@ -103,6 +143,6 @@ void rc_prx_pwm_apply_ctrl(const struct rc_link_frame *ctrl)
 		return;
 	}
 
-	apply_values(ctrl->channels, ctrl->channel_count);
+	apply_ctrl_channels(ctrl->channels, ctrl->channel_count);
 	(void)k_work_reschedule(&failsafe_work, K_MSEC(RC_PWM_FAILSAFE_MS));
 }

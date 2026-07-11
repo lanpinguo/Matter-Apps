@@ -108,7 +108,7 @@
 
 		rc_pwm4: rc_pwm_4 {
 			pwms = <&pwm21 0 PWM_USEC(20000) PWM_POLARITY_NORMAL>;
-			label = "RC PWM CH4 (P1.10)";
+			label = "RC PWM CH4 throttle RT (P1.10)";
 		};
 	};
 };
