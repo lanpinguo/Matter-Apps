@@ -28,6 +28,8 @@
 
 #include <dk_buttons_and_leds.h>
 
+#include "battery_monitor.h"
+
 #define DEVICE_NAME             CONFIG_BT_DEVICE_NAME
 #define DEVICE_NAME_LEN         (sizeof(DEVICE_NAME) - 1)
 
@@ -35,6 +37,7 @@
 #define CON_STATUS_LED          DK_LED2
 #define RUN_LED_BLINK_INTERVAL  1000
 #define ADC_SAMPLE_INTERVAL_MS  1000
+#define BATTERY_SAMPLE_INTERVAL_MS 1000
 #define FIXED_PASSKEY           123456
 
 #define STATUS1_BUTTON          DK_BTN1_MSK
@@ -446,6 +449,83 @@ static void adc_sampling_start(void)
 }
 #endif
 
+/*
+ * INA226 battery monitor: sample voltage/current/power once a second and push
+ * the result as text lines the mobile app parses:
+ *   BAT_V <volts>\nBAT_I <amps>\nBAT_P <watts>\nBAT_ST <charging|discharging|idle>
+ */
+static struct k_work_delayable battery_work;
+
+static void fmt_milli(char *buf, size_t size, int32_t milli)
+{
+	int32_t whole = milli / 1000;
+	int32_t frac = milli % 1000;
+
+	if (frac < 0) {
+		frac = -frac;
+	}
+
+	/* Preserve the sign when the integer part rounds to zero (e.g. -0.250). */
+	if (milli < 0 && whole == 0) {
+		snprintf(buf, size, "-0.%03d", frac);
+	} else {
+		snprintf(buf, size, "%d.%03d", whole, frac);
+	}
+}
+
+static void battery_work_handler(struct k_work *work)
+{
+	struct battery_reading reading;
+	char vbuf[16];
+	char ibuf[16];
+	char pbuf[16];
+	char msg[96];
+	int err;
+
+	ARG_UNUSED(work);
+
+	err = battery_monitor_read(&reading);
+	if (err) {
+		printk("Battery read failed (err %d)\n", err);
+		k_work_schedule(&battery_work, K_MSEC(BATTERY_SAMPLE_INTERVAL_MS));
+		return;
+	}
+
+	fmt_milli(vbuf, sizeof(vbuf), reading.voltage_mv);
+	fmt_milli(ibuf, sizeof(ibuf), reading.current_ma);
+	fmt_milli(pbuf, sizeof(pbuf), reading.power_mw);
+
+	snprintf(msg, sizeof(msg), "BAT_V %s\nBAT_I %s\nBAT_P %s\nBAT_ST %s",
+		 vbuf, ibuf, pbuf,
+		 battery_state_str(battery_monitor_state(&reading)));
+
+	send_status_update(msg);
+	k_work_schedule(&battery_work, K_MSEC(BATTERY_SAMPLE_INTERVAL_MS));
+}
+
+static void init_battery_monitor(void)
+{
+	/*
+	 * The battery monitor is optional hardware. If the INA226 is absent or
+	 * fails to probe, log it and continue — it must never block Bluetooth.
+	 */
+	int err = battery_monitor_init();
+
+	if (err || !battery_monitor_available()) {
+		printk("Battery monitor unavailable (err %d) — continuing without it\n", err);
+		return;
+	}
+
+	k_work_init_delayable(&battery_work, battery_work_handler);
+}
+
+static void battery_sampling_start(void)
+{
+	if (battery_monitor_available()) {
+		k_work_schedule(&battery_work, K_NO_WAIT);
+	}
+}
+
 int main(void)
 {
 	int blink_status = 0;
@@ -465,10 +545,13 @@ int main(void)
 		return 0;
 	}
 
+	/*
+	 * PCF8574 IO expanders are optional. If they are absent or fail to
+	 * probe, log it and continue — they must never block Bluetooth.
+	 */
 	err = init_pcf8574_int();
 	if (err) {
-		printk("PCF8574 interrupt init failed (err %d)\n", err);
-		return 0;
+		printk("PCF8574 unavailable (err %d) — continuing without it\n", err);
 	}
 
 	err = init_adc();
@@ -476,6 +559,8 @@ int main(void)
 		printk("ADC init failed (err %d)\n", err);
 		return 0;
 	}
+
+	init_battery_monitor();
 
 	err = bt_enable(NULL);
 	if (err) {
@@ -502,6 +587,7 @@ int main(void)
 	k_work_init(&adv_work, adv_work_handler);
 	advertising_start();
 	adc_sampling_start();
+	battery_sampling_start();
 
 	for (;;) {
 		dk_set_led(RUN_STATUS_LED, (++blink_status) % 2);

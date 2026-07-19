@@ -15,6 +15,9 @@
 		/* Two PCF8574 share INT# on P0.02 */
 		pcf8574a-left = &io_keyboard_left;
 		pcf8574a-right = &io_keyboard_right;
+
+		/* INA226 lead-acid battery charge monitor on i2c22 */
+		battery-monitor = &battery_monitor;
 	};
 
 	chosen {
@@ -196,7 +199,28 @@
 		ngpios = <8>;
 	};
 
-
+	/*
+	 * INA226 high-side current/power monitor for lead-acid battery charging.
+	 * Default I2C address 0x40 (A0=A1=GND).
+	 *
+	 * IMPORTANT — tune to your hardware:
+	 *   rshunt-micro-ohms       shunt resistor value (2000 = R002 / 2 mΩ,
+	 *                           a very common INA226 breakout value).
+	 *   current-lsb-microamps   = max expected current [µA] / 2^15.
+	 *                           500 µA/LSB → ~±16.4 A full-scale.
+	 * Current sign depends on shunt wiring (IN+ vs IN-); positive is treated
+	 * as charging in firmware. Swap IN+/IN- (or flip in code) if inverted.
+	 */
+	battery_monitor: ina226@40 {
+		compatible = "ti,ina226";
+		reg = <0x40>;
+		current-lsb-microamps = <500>;
+		rshunt-micro-ohms = <2000>;
+		avg-count = <16>;
+		vbus-conversion-time-us = <1100>;
+		vshunt-conversion-time-us = <1100>;
+		operating-mode = "Shunt and Bus, Continuous";
+	};
 
 	clock-frequency = <I2C_BITRATE_STANDARD>;
 };
