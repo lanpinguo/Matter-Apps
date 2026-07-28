@@ -12,5 +12,6 @@ target_sources(app PRIVATE
   src/main.c
   src/xbox_report.c
   src/xbox_hids.c
+  src/bq25895.c
   ../../esb/common/uart_rc_link.c
 )

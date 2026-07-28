@@ -31,6 +31,7 @@
 #include "xbox_hids.h"
 #include "xbox_report.h"
 #include "uart_rc_link.h"
+#include "bq25895.h"
 
 #define CONN_LED                       DK_LED1
 #define REPORT_LOG_INTERVAL_MS         100
@@ -38,6 +39,7 @@
 #define TELEMETRY_MIN_INTERVAL_MS      20
 #define TELEMETRY_MAX_INTERVAL_MS      500
 #define UART_CTRL_HEARTBEAT_MS         100
+#define POWER_SAMPLE_INTERVAL_MS       2000
 #define CONFIG_PARAM_TELEMETRY_MS      1
 #define SETTINGS_KEY_TELEMETRY_MS      "xbox_hub/telemetry_ms"
 #define SETTINGS_KEY_XBOX_ADDR         "xbox_hub/xbox_addr"
@@ -107,6 +109,25 @@ static void uart_log_esb_cfg(const struct uart_rc_esb_config *cfg)
 #define HUB_SVC_UUID_VAL BT_UUID_128_ENCODE(0x57a71000, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 #define HUB_TELEM_UUID_VAL BT_UUID_128_ENCODE(0x57a71001, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 #define HUB_CFG_UUID_VAL BT_UUID_128_ENCODE(0x57a71002, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
+#define HUB_PWR_UUID_VAL BT_UUID_128_ENCODE(0x57a71003, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
+
+/* Power/charge status flags. */
+#define HUB_PWR_FLAG_VALID       BIT(0)
+#define HUB_PWR_FLAG_POWER_GOOD  BIT(1)
+#define HUB_PWR_FLAG_VBUS        BIT(2)
+
+struct hub_power_payload {
+	uint8_t version;
+	uint8_t flags;
+	uint8_t charge_state;
+	uint8_t vbus_state;
+	uint8_t fault;
+	uint8_t battery_pct;
+	uint16_t batt_mv;
+	uint16_t sys_mv;
+	uint16_t vbus_mv;
+	uint16_t charge_ma;
+} __packed;
 
 struct hub_telemetry_payload {
 	uint8_t version;
@@ -132,6 +153,8 @@ static struct bt_conn *auth_conn;
 static struct xbox_hids hids;
 static struct xbox_gamepad_state latest_state;
 static struct hub_telemetry_payload telemetry_data;
+static struct hub_power_payload power_data;
+static struct k_work_delayable power_work;
 static uint16_t telemetry_interval_ms = TELEMETRY_DEFAULT_INTERVAL_MS;
 static int64_t last_report_log_ms;
 static bool discovery_active;
@@ -173,6 +196,8 @@ static ssize_t cfg_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr
 			   void *buf, uint16_t len, uint16_t offset);
 static ssize_t cfg_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			    const void *buf, uint16_t len, uint16_t offset, uint8_t flags);
+static ssize_t power_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset);
 
 BT_GATT_SERVICE_DEFINE(hub_svc,
 	BT_GATT_PRIMARY_SERVICE(BT_UUID_DECLARE_128(HUB_SVC_UUID_VAL)),
@@ -184,8 +209,16 @@ BT_GATT_SERVICE_DEFINE(hub_svc,
 	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(HUB_CFG_UUID_VAL),
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
-			       cfg_read_cb, cfg_write_cb, NULL)
+			       cfg_read_cb, cfg_write_cb, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(HUB_PWR_UUID_VAL),
+			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_READ,
+			       power_read_cb, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
+
+/* Power characteristic value attribute index within hub_svc (see table above). */
+#define HUB_PWR_VALUE_ATTR_IDX 7
 
 static const uint8_t adv_flags[] = { BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR };
 static const uint8_t adv_uuid[] = {
@@ -944,6 +977,81 @@ static void telemetry_work_handler(struct k_work *work)
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
 }
 
+static ssize_t power_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
+			     void *buf, uint16_t len, uint16_t offset)
+{
+	struct hub_power_payload snapshot;
+
+	ARG_UNUSED(attr);
+	k_mutex_lock(&data_mutex, K_FOREVER);
+	snapshot = power_data;
+	k_mutex_unlock(&data_mutex);
+
+	return bt_gatt_attr_read(conn, attr, buf, len, offset, &snapshot, sizeof(snapshot));
+}
+
+static void power_work_handler(struct k_work *work)
+{
+	struct bq25895_status st;
+	struct hub_power_payload payload = {
+		.version = 1U,
+	};
+	int err;
+
+	ARG_UNUSED(work);
+
+	err = bq25895_read(&st);
+	if (err == 0) {
+		payload.flags = HUB_PWR_FLAG_VALID;
+		if (st.power_good) {
+			payload.flags |= HUB_PWR_FLAG_POWER_GOOD;
+		}
+		if (st.vbus_present) {
+			payload.flags |= HUB_PWR_FLAG_VBUS;
+		}
+		payload.charge_state = (uint8_t)st.charge_state;
+		payload.vbus_state = (uint8_t)st.vbus_state;
+		payload.fault = st.fault;
+		payload.battery_pct = st.battery_pct;
+		payload.batt_mv = st.batt_mv;
+		payload.sys_mv = st.sys_mv;
+		payload.vbus_mv = st.vbus_mv;
+		payload.charge_ma = st.charge_ma;
+
+		printk("BQ25895 batt=%umV %u%% sys=%umV vbus=%umV(%s) ichg=%umA %s\n",
+		       st.batt_mv, st.battery_pct, st.sys_mv, st.vbus_mv,
+		       bq25895_vbus_state_str(st.vbus_state), st.charge_ma,
+		       bq25895_charge_state_str(st.charge_state));
+	} else {
+		printk("BQ25895 read failed: %d\n", err);
+	}
+
+	k_mutex_lock(&data_mutex, K_FOREVER);
+	power_data = payload;
+	k_mutex_unlock(&data_mutex);
+
+	err = bt_gatt_notify(NULL, &hub_svc.attrs[HUB_PWR_VALUE_ATTR_IDX],
+			     &payload, sizeof(payload));
+	if (err && err != -ENOTCONN && err != -EAGAIN) {
+		printk("Power notify failed: %d\n", err);
+	}
+
+	k_work_schedule(&power_work, K_MSEC(POWER_SAMPLE_INTERVAL_MS));
+}
+
+static void power_monitor_start(void)
+{
+	int err = bq25895_init();
+
+	if (err || !bq25895_available()) {
+		printk("BQ25895 unavailable (err %d) — power status disabled\n", err);
+		return;
+	}
+
+	k_work_init_delayable(&power_work, power_work_handler);
+	k_work_schedule(&power_work, K_NO_WAIT);
+}
+
 static int settings_set_cb(const char *name, size_t len, settings_read_cb read_cb,
 			   void *cb_arg)
 {
@@ -1580,6 +1688,8 @@ int main(void)
 	k_work_init_delayable(&uart_ctrl_heartbeat_work, uart_ctrl_heartbeat_handler);
 	memset(&latest_state, 0, sizeof(latest_state));
 	memset(&telemetry_data, 0, sizeof(telemetry_data));
+	memset(&power_data, 0, sizeof(power_data));
+	power_data.version = 1U;
 
 	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
 	if (err) {
@@ -1642,6 +1752,9 @@ int main(void)
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
 	k_work_schedule(&uart_ctrl_heartbeat_work, K_MSEC(UART_CTRL_HEARTBEAT_MS));
 	k_work_schedule(&adv_guard_work, K_SECONDS(2));
+
+	/* BQ25895 is optional — never blocks BLE if absent. */
+	power_monitor_start();
 	printk("Scanning Xbox, advertising to phone, UART link enabled\n");
 	printk("UART CTRL heartbeat %u ms while Xbox connected\n",
 	       UART_CTRL_HEARTBEAT_MS);

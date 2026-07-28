@@ -2,7 +2,14 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  *
  * Hub RC link on uart30: TX/RX only (no hardware flow control).
+ * BQ25895 power/charge manager on i2c22 (SCL P1.11, SDA P1.12, addr 0x6A).
  */
+
+/ {
+	aliases {
+		battery-charger = &bq25895;
+	};
+};
 
 &pinctrl {
 	uart30_default: uart30_default {
@@ -23,6 +30,28 @@
 			low-power-enable;
 		};
 	};
+
+	/*
+	 * I2C22 for the BQ25895. P1.11/P1.12 are free on the DK
+	 * (console uart20 uses P1.4-P1.7, buttons use P1.13/P1.9/P1.8).
+	 * Adjust these psels to match your actual BQ25895 wiring.
+	 */
+	i2c22_default: i2c22_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SCL, 1, 11)>,
+				<NRF_PSEL(TWIM_SDA, 1, 12)>;
+			bias-pull-up;
+		};
+	};
+
+	i2c22_sleep: i2c22_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SCL, 1, 11)>,
+				<NRF_PSEL(TWIM_SDA, 1, 12)>;
+			low-power-enable;
+			bias-pull-up;
+		};
+	};
 };
 
 &uart30 {
@@ -31,4 +60,18 @@
 	pinctrl-0 = <&uart30_default>;
 	pinctrl-1 = <&uart30_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+&i2c22 {
+	status = "okay";
+	pinctrl-0 = <&i2c22_default>;
+	pinctrl-1 = <&i2c22_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+
+	/* BQ25895 has a fixed 7-bit I2C address of 0x6A. */
+	bq25895: charger@6a {
+		compatible = "ti,bq25895";
+		reg = <0x6a>;
+	};
 };
