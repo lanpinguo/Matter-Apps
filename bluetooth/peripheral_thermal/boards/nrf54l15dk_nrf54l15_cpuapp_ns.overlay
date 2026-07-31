@@ -1,0 +1,85 @@
+/*
+ * nRF54L15 DK (cpuapp_ns / TF-M) — MLX90640 on I2C22
+ *
+ * Wiring (3.3 V logic):
+ *   MLX90640 VIN  -> 3V3
+ *   MLX90640 GND  -> GND
+ *   MLX90640 SCL  -> P1.12  (same as peripheral_status)
+ *   MLX90640 SDA  -> P1.13
+ *
+ * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+ */
+
+/ {
+	aliases {
+		watchdog0 = &wdt31;
+	};
+
+	chosen {
+		nordic,pm-ext-flash = &mx25r64;
+	};
+};
+
+&cpuapp_rram {
+	reg = <0x0 DT_SIZE_K(1524)>;
+};
+
+&cpuapp_sram {
+	reg = <0x20000000 DT_SIZE_K(256)>;
+	ranges = <0x0 0x20000000 0x40000>;
+};
+
+&uart20 {
+	/delete-property/ hw-flow-control;
+};
+
+&mx25r64 {
+	status = "okay";
+};
+
+&wdt31 {
+	status = "okay";
+};
+
+/* TF-M reserves default GPIOTE IRQs; use NS-safe IDs */
+&gpiote20 {
+	interrupts = <218 NRF_DEFAULT_IRQ_PRIORITY>;
+};
+
+&gpiote30 {
+	interrupts = <268 NRF_DEFAULT_IRQ_PRIORITY>;
+};
+
+&pinctrl {
+	i2c22_default: i2c22_default {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 13)>,
+				<NRF_PSEL(TWIM_SCL, 1, 12)>;
+			bias-pull-up;
+		};
+	};
+
+	i2c22_sleep: i2c22_sleep {
+		group1 {
+			psels = <NRF_PSEL(TWIM_SDA, 1, 13)>,
+				<NRF_PSEL(TWIM_SCL, 1, 12)>;
+			low-power-enable;
+			bias-pull-up;
+		};
+	};
+};
+
+&i2c22 {
+	status = "okay";
+	pinctrl-0 = <&i2c22_default>;
+	pinctrl-1 = <&i2c22_sleep>;
+	pinctrl-names = "default", "sleep";
+	clock-frequency = <I2C_BITRATE_FAST>;
+	zephyr,concat-buf-size = <256>;
+	zephyr,flash-buf-max-size = <256>;
+
+	mlx90640: mlx90640@33 {
+		compatible = "melexis,mlx90640";
+		reg = <0x33>;
+	};
+};

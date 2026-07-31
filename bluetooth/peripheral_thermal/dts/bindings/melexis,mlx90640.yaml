@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# Minimal binding — register-level I2C access in application code.
+
+description: Melexis MLX90640 32x24 FIR array
+
+compatible: "melexis,mlx90640"
+
+include: [i2c-device.yaml]
