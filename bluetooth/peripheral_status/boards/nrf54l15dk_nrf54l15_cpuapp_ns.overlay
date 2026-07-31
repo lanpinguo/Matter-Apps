@@ -203,19 +203,17 @@
 	 * INA226 high-side current/power monitor for lead-acid battery charging.
 	 * Default I2C address 0x40 (A0=A1=GND).
 	 *
-	 * IMPORTANT — tune to your hardware:
-	 *   rshunt-micro-ohms       shunt resistor value (2000 = R002 / 2 mΩ,
-	 *                           a very common INA226 breakout value).
-	 *   current-lsb-microamps   = max expected current [µA] / 2^15.
-	 *                           500 µA/LSB → ~±16.4 A full-scale.
+	 * Hardware: Rshunt = 20 mΩ.
+	 *   Max shunt sense ±81.92 mV → Imax ≈ 81.92 mV / 20 mΩ ≈ ±4.1 A.
+	 *   current-lsb = Imax / 2^15 ≈ 125 µA/LSB.
 	 * Current sign depends on shunt wiring (IN+ vs IN-); positive is treated
 	 * as charging in firmware. Swap IN+/IN- (or flip in code) if inverted.
 	 */
 	battery_monitor: ina226@40 {
 		compatible = "ti,ina226";
 		reg = <0x40>;
-		current-lsb-microamps = <500>;
-		rshunt-micro-ohms = <2000>;
+		current-lsb-microamps = <125>;
+		rshunt-micro-ohms = <20000>;
 		avg-count = <16>;
 		vbus-conversion-time-us = <1100>;
 		vshunt-conversion-time-us = <1100>;
