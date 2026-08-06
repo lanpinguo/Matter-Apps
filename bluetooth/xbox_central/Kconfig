@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+
+mainmenu "Ground BLE Hub"
+
+source "Kconfig.zephyr"
+
+menu "BQ25895 battery profile"
+
+config BQ25895_BATT_CAPACITY_MAH
+	int "LiPo cell capacity (mAh)"
+	default 200
+	range 50 10000
+	help
+	  Rated capacity of the connected single-cell LiPo.
+	  Fast-charge current is derived as ~0.5C (rounded to the
+	  BQ25895 64 mA step). Change this when swapping to a larger pack.
+
+config BQ25895_CHARGE_RATE_MILLIC
+	int "Charge rate in milli-C (500 = 0.5C)"
+	default 500
+	range 100 1000
+	help
+	  Fast-charge rate relative to capacity. 500 = 0.5C (typical LiPo).
+	  ICHG = capacity_mAh * rate / 1000, then rounded to 64 mA steps
+	  (minimum 64 mA, maximum 3008 mA).
+
+endmenu

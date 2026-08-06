@@ -1,11 +1,17 @@
 # SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
 #
 # Minimal binding for the TI BQ25895 I2C switch-mode battery charger.
-# The firmware talks to it with register-level I2C access, so only the
-# I2C address (reg) is required here.
+# The firmware talks to it with register-level I2C access.
 
 description: TI BQ25895 switch-mode battery charger / power path manager
 
 compatible: "ti,bq25895"
 
 include: [i2c-device.yaml]
+
+properties:
+  int-gpios:
+    type: phandle-array
+    description: |
+      Open-drain INT pin (active-low ~256 µs pulse). Connect to a GPIO with
+      pull-up; host uses falling-edge IRQ to read status / clear REG0C.

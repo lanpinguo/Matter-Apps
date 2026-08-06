@@ -6,7 +6,9 @@
 
 #include <stdio.h>
 #include <zephyr/sys/byteorder.h>
-#include <zephyr/sys/printk.h>
+#include "hub_log.h"
+
+HUB_LOG_MODULE_DEFINE(HUB_MOD_INPUT);
 
 #define STICK_CENTER 32768
 
@@ -128,13 +130,13 @@ void xbox_report_print(const struct xbox_gamepad_state *state)
 
 #undef APPEND_BTN
 
-	printk("sticks L(%d,%d) R(%d,%d) triggers LT=%u RT=%u dpad=%s(%u)",
+	HUB_DBG("sticks L(%d,%d) R(%d,%d) triggers LT=%u RT=%u dpad=%s(%u)",
 	       state->lx, state->ly, state->rx, state->ry,
 	       state->lt, state->rt, dpad_name(state->dpad), state->dpad);
 
 	if (pressed[0] != '\0') {
-		printk(" buttons=%s", pressed);
+		HUB_DBG(" buttons=%s", pressed);
 	}
 
-	printk("\n");
+	HUB_DBG("\n");
 }

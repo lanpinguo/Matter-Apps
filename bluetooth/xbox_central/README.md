@@ -20,6 +20,7 @@ Single-chip BLE hub on nRF54L15:
 
 - Board: `nrf54l15dk/nrf54l15/cpuapp`
 - Xbox Wireless Controller in **Bluetooth mode** (hold Sync to pair)
+- Status LED on **P2.07**（`status-led`，**低电平点亮**）：慢闪=运行中，快闪=Xbox 已连接；板载 LED1 仍表示 Xbox 连接
 
 ## Build and flash
 
@@ -46,6 +47,11 @@ Open a serial terminal at 115200 baud.
 - Service UUID: `57a71000-9350-11ed-a1eb-0242ac120002`
 - Telemetry Char UUID: `57a71001-9350-11ed-a1eb-0242ac120002`
 - Config Char UUID: `57a71002-9350-11ed-a1eb-0242ac120002`
+- Power Char UUID: `57a71003-9350-11ed-a1eb-0242ac120002`
+  - VBUS 在位/充电中约 **1 Hz** notify；空闲约 **30 s**；INT 仍立即采样
+
+- LogCtrl Char UUID: `57a71004-9350-11ed-a1eb-0242ac120002` (write)
+- LogData Char UUID: `57a71005-9350-11ed-a1eb-0242ac120002` (notify)
 
 ### Telemetry payload (notify/read)
 
@@ -63,6 +69,24 @@ Packed struct:
 
 - `param_id = 1`: set telemetry interval in milliseconds (`20..500`)
 
+### Flash log over BLE
+
+1. Subscribe LogData notify.
+2. Write LogCtrl START (LE):
+
+`op=0x01, flags, limit_u16, from_u16, mod_mask_u32, level_max_u8, kw_len, kw[]`
+
+- `flags bit0`: take_tail（取最近 N 条）
+- `level_max=0xFF`: 全部级别；否则仅 `level <= level_max`
+- `mod_mask=0`: 固件按全部模块处理
+
+3. 设备分片 notify：
+   - `BEGIN 0x01 | total_u16 | reserved_u32`
+   - `REC 0x02 | idx_u16 | boot_id_u32 | uptime_ms_u32 | mod | level | text_len | text[]`
+   - `END 0x03 | status`（0=ok，1=abort，2=error）
+4. 可写 `op=0x02` STOP 中止。
+
+单次导出匹配上限 256 条（与 `flog show` 相同）。
 ## UART link to ESB module (HUART-RC)
 
 Link layer uses **HDLC** framing (same style as OpenThread Spinel RCP):
@@ -105,6 +129,81 @@ Buttons:
 
 OTA pair checklist: PRX in pair mode → Hub UART to PTX → hold Btn4 1.5s → wait for PRX
 ``Paired from first valid pair frame``.
+
+## BQ25895 shell debug (console uart20 @ 115200)
+
+STAT 约 1 Hz 闪烁通常表示故障锁存。烧录后：
+
+1. **按 DK Button1** 可随时 dump 寄存器
+2. 交互 Shell（轮询模式）：回车出现 `hub>` 后输入：
+
+```text
+hub> bq dump
+hub> bq status
+hub> bq read 0x0c
+```
+
+优先看 **REG0C**（NTC/输入/看门狗）和 **REG0B**（VBUS/充电状态）。
+
+### 电池充电参数（LiPo）
+
+当前默认 **200 mAh** 单节锂聚合物，约 **0.5C** 快充（BQ25895 按 64 mA 步进圆整后约为 **ICHG=128 mA**，ITERM/IPRECHG=64 mA 芯片下限）。
+
+换更大容量电池时，在 `prj.conf` 改一项即可（或 `menuconfig`）：
+
+```text
+CONFIG_BQ25895_BATT_CAPACITY_MAH=1000   # 例：1000 mAh → ICHG≈512 mA
+# CONFIG_BQ25895_CHARGE_RATE_MILLIC=500  # 可选，默认 0.5C
+```
+
+烧录后用 `bq status` / 启动日志确认 `ICHG=` 是否符合预期。
+
+## 应用日志（外部 Flash，按模块）
+
+模块：`sys` `xbox` `hid` `phone` `uart` `esb` `bq` `input`  
+默认写入 MX25R64 前 **1 MiB** **统一公共环形区**（4KB 扇区擦除；末页为 scratch）。  
+回收时丢弃**同级别**条目，其它级别经 scratch **压缩写回**页首（近似按条目回收）。  
+记录带 `flags` 软删；dump 跳过已删条目。GC 窗口断电可能丢该页上本应保留的条目。  
+每条记录时间戳：`boot_id` + 启动后相对时间，显示为 `b3+0:01:23.456`。  
+各模块默认 `inf`（`input` 默认 `wrn`）。
+
+```text
+hub> loglevel
+hub> loglevel xbox dbg
+hub> flog status
+hub> flog show                      # 最近 50 行（带 #行号）
+hub> flog show 100
+hub> flog show from 200             # 从匹配行 #200 起看 50 行
+hub> flog show from 200 20          # 从 #200 起看 20 行
+hub> flog show /0x3e 50             # 关键词（不区分大小写）
+hub> flog show kw:fail !bq
+hub> flog find disconnect           # 等价于带关键词的查找
+hub> flog find Security 20 xbox
+hub> flog show 50 !bq !input
+hub> flog clear
+```
+
+行号 `#idx` 是**过滤后**从最旧到最新的序号，可用 `from <idx>` 接着往下看。
+`/keyword` 与 `kw:keyword`、`flog find` 均为正文子串匹配（忽略大小写）。
+
+`flog show` 的等级过滤为 **≤ 指定等级**（`err` ⊂ `wrn` ⊂ `inf` ⊂ `dbg`）。  
+升级后旧 Flash 日志格式会自动清空重建（当前 meta v5：4KB + 软删/GC）。
+
+DK Flash：SCK P2.01、MOSI P2.02、MISO P2.04、CS P2.05。
+
+## 串口
+
+在 **CP2104 `/dev/ttyUSB0`**（或 DK VCOM）上打开**双向**终端：
+
+```bash
+screen -x
+# 或
+screen /dev/ttyUSB0 115200
+```
+
+接线：MCU `uart20` **P1.04 TX → CP2104 RX**，**P1.05 RX ← CP2104 TX**，共地。不要接 RTS/CTS。
+
+Button1 / `bq dump` 不受过滤。
 
 ## Report format
 

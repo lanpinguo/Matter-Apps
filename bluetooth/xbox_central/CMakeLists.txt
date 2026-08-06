@@ -13,5 +13,12 @@ target_sources(app PRIVATE
   src/xbox_report.c
   src/xbox_hids.c
   src/bq25895.c
+  src/bq_shell.c
+  src/hub_log.c
+  src/hub_flash_log.c
+  src/hub_ble_log.c
+  src/hub_status_led.c
+  src/loglevel_shell.c
+  src/flog_shell.c
   ../../esb/common/uart_rc_link.c
 )

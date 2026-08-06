@@ -12,7 +12,7 @@
 #include <string.h>
 
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include "hub_log.h"
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/settings/settings.h>
 #include <zephyr/logging/log.h>
@@ -32,6 +32,9 @@
 #include "xbox_report.h"
 #include "uart_rc_link.h"
 #include "bq25895.h"
+#include "hub_ble_log.h"
+#include "hub_flash_log.h"
+#include "hub_status_led.h"
 
 #define CONN_LED                       DK_LED1
 #define REPORT_LOG_INTERVAL_MS         100
@@ -39,7 +42,8 @@
 #define TELEMETRY_MIN_INTERVAL_MS      20
 #define TELEMETRY_MAX_INTERVAL_MS      500
 #define UART_CTRL_HEARTBEAT_MS         100
-#define POWER_SAMPLE_INTERVAL_MS       2000
+#define POWER_HEARTBEAT_IDLE_MS        30000 /* SoC refresh when not charging */
+#define POWER_HEARTBEAT_CHARGING_MS     1000 /* Live charge telemetry for phone */
 #define CONFIG_PARAM_TELEMETRY_MS      1
 #define SETTINGS_KEY_TELEMETRY_MS      "xbox_hub/telemetry_ms"
 #define SETTINGS_KEY_XBOX_ADDR         "xbox_hub/xbox_addr"
@@ -82,11 +86,11 @@ static const char *uart_esb_cmd_name(uint8_t cmd)
 
 static void uart_log_addr8(const char *label, const uint8_t *p, size_t n)
 {
-	printk("  %s:", label);
+	HUB_DBG_M(HUB_MOD_UART, "  %s:", label);
 	for (size_t i = 0; i < n; i++) {
-		printk(" %02x", p[i]);
+		HUB_DBG_M(HUB_MOD_UART, " %02x", p[i]);
 	}
-	printk("\n");
+	HUB_DBG_M(HUB_MOD_UART, "\n");
 }
 
 static void uart_log_esb_cfg(const struct uart_rc_esb_config *cfg)
@@ -95,7 +99,7 @@ static void uart_log_esb_cfg(const struct uart_rc_esb_config *cfg)
 		return;
 	}
 
-	printk("  radio: pipe=%u pwr=%d delay=%u bitrate=%u\n", cfg->pipe, cfg->tx_power,
+	HUB_DBG_M(HUB_MOD_UART, "  radio: pipe=%u pwr=%d delay=%u bitrate=%u\n", cfg->pipe, cfg->tx_power,
 	       cfg->retransmit_delay, cfg->bitrate);
 	uart_log_addr8("base0", cfg->base0, sizeof(cfg->base0));
 	uart_log_addr8("base1", cfg->base1, sizeof(cfg->base1));
@@ -110,6 +114,8 @@ static void uart_log_esb_cfg(const struct uart_rc_esb_config *cfg)
 #define HUB_TELEM_UUID_VAL BT_UUID_128_ENCODE(0x57a71001, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 #define HUB_CFG_UUID_VAL BT_UUID_128_ENCODE(0x57a71002, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 #define HUB_PWR_UUID_VAL BT_UUID_128_ENCODE(0x57a71003, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
+#define HUB_LOGCTRL_UUID_VAL BT_UUID_128_ENCODE(0x57a71004, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
+#define HUB_LOGDATA_UUID_VAL BT_UUID_128_ENCODE(0x57a71005, HUB_UUID_W1, HUB_UUID_W2, HUB_UUID_W3, HUB_UUID_W48)
 
 /* Power/charge status flags. */
 #define HUB_PWR_FLAG_VALID       BIT(0)
@@ -214,11 +220,21 @@ BT_GATT_SERVICE_DEFINE(hub_svc,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ,
 			       power_read_cb, NULL, NULL),
+	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(HUB_LOGCTRL_UUID_VAL),
+			       BT_GATT_CHRC_WRITE,
+			       BT_GATT_PERM_WRITE,
+			       NULL, hub_ble_log_ctrl_write, NULL),
+	BT_GATT_CHARACTERISTIC(BT_UUID_DECLARE_128(HUB_LOGDATA_UUID_VAL),
+			       BT_GATT_CHRC_NOTIFY,
+			       BT_GATT_PERM_NONE,
+			       NULL, NULL, NULL),
 	BT_GATT_CCC(NULL, BT_GATT_PERM_READ | BT_GATT_PERM_WRITE)
 );
 
-/* Power characteristic value attribute index within hub_svc (see table above). */
+/* Characteristic value attribute indices within hub_svc. */
 #define HUB_PWR_VALUE_ATTR_IDX 7
+#define HUB_LOGDATA_VALUE_ATTR_IDX 12
 
 static const uint8_t adv_flags[] = { BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR };
 static const uint8_t adv_uuid[] = {
@@ -303,15 +319,15 @@ static void xbox_log_adv_match(const char *addr, struct net_buf_simple *adv_data
 	}
 
 	if (ctx.name.found && strstr(ctx.name.name, "Xbox") != NULL) {
-		printk("Xbox controller found: %s ('%s')\n", addr, ctx.name.name);
+		HUB_INF_M(HUB_MOD_XBOX, "Xbox controller found: %s ('%s')\n", addr, ctx.name.name);
 	} else if (ctx.ms_mfg) {
-		printk("Microsoft HID device found: %s\n", addr);
+		HUB_INF_M(HUB_MOD_HID, "Microsoft HID device found: %s\n", addr);
 	} else if (ctx.gamepad) {
-		printk("HID gamepad found: %s (appearance 0x%04x)\n", addr, ctx.appearance);
+		HUB_INF_M(HUB_MOD_HID, "HID gamepad found: %s (appearance 0x%04x)\n", addr, ctx.appearance);
 	} else if (ctx.name.found) {
-		printk("HID UUID match: %s (name '%s')\n", addr, ctx.name.name);
+		HUB_INF_M(HUB_MOD_HID, "HID UUID match: %s (name '%s')\n", addr, ctx.name.name);
 	} else {
-		printk("HID UUID match: %s (name likely in scan response)\n", addr);
+		HUB_INF_M(HUB_MOD_HID, "HID UUID match: %s (name likely in scan response)\n", addr);
 	}
 }
 
@@ -347,7 +363,7 @@ static void xbox_sec_work_handler(struct k_work *work)
 		return;
 	}
 
-	printk("Xbox security request err %d (retry %u)\n", err, xbox_sec_retries);
+	HUB_WRN_M(HUB_MOD_XBOX, "Xbox security request err %d (retry %u)\n", err, xbox_sec_retries);
 
 	if ((err == -EBUSY || err == -ENOMEM || err == -EAGAIN) &&
 	    ++xbox_sec_retries < XBOX_SEC_RETRY_MAX) {
@@ -382,9 +398,9 @@ static void clear_xbox_bond(const struct bt_conn *conn)
 	bt_addr_le_to_str(dst, addr, sizeof(addr));
 	err = bt_unpair(BT_ID_DEFAULT, dst);
 	if (err == 0) {
-		printk("Cleared bond for %s\n", addr);
+		HUB_WRN_M(HUB_MOD_XBOX, "Cleared bond for %s\n", addr);
 	} else if (err != -ENOENT) {
-		printk("Bond clear failed for %s: %d\n", addr, err);
+		HUB_ERR_M(HUB_MOD_XBOX, "Bond clear failed for %s: %d\n", addr, err);
 	}
 
 	if (bonded_xbox_valid && bt_addr_le_cmp(dst, &bonded_xbox_addr) == 0) {
@@ -398,7 +414,7 @@ static void clear_bonded_xbox(void)
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	if (!bonded_xbox_valid) {
-		printk("No bonded Xbox controller\n");
+		HUB_INF_M(HUB_MOD_XBOX, "No bonded Xbox controller\n");
 		return;
 	}
 
@@ -406,7 +422,7 @@ static void clear_bonded_xbox(void)
 	(void)bt_unpair(BT_ID_DEFAULT, &bonded_xbox_addr);
 	bonded_xbox_valid = false;
 	(void)settings_delete(SETTINGS_KEY_XBOX_ADDR);
-	printk("Cleared bonded Xbox %s — hold Sync to pair again\n", addr);
+	HUB_WRN_M(HUB_MOD_XBOX, "Cleared bonded Xbox %s — hold Sync to pair again\n", addr);
 }
 
 static void phone_adv_pause(void)
@@ -419,7 +435,7 @@ static void phone_adv_pause(void)
 
 	if (bt_le_adv_stop() == 0) {
 		adv_running = false;
-		printk("Phone adv paused for Xbox link\n");
+		HUB_INF_M(HUB_MOD_PHONE, "Phone adv paused for Xbox link\n");
 	}
 }
 
@@ -435,7 +451,7 @@ static void phone_adv_resume(void)
 	}
 
 	if (adv_start() == 0) {
-		printk("Phone adv resumed\n");
+		HUB_INF_M(HUB_MOD_PHONE, "Phone adv resumed\n");
 	}
 }
 
@@ -453,7 +469,7 @@ static void xbox_scan_retry_handler(struct k_work *work)
 		return;
 	}
 
-	printk("Retrying Xbox scan\n");
+	HUB_WRN_M(HUB_MOD_XBOX, "Retrying Xbox scan\n");
 	restart_scan();
 }
 
@@ -463,7 +479,7 @@ static void xbox_link_failed_retry(uint8_t hci_err)
 	xbox_link_setup = false;
 
 	if (hci_err == BT_HCI_ERR_CONN_FAIL_TO_ESTAB) {
-		printk("Xbox 0x3e — retry scan in %u ms\n", XBOX_SCAN_RETRY_MS);
+		HUB_WRN_M(HUB_MOD_XBOX, "Xbox 0x3e — retry scan in %u ms\n", XBOX_SCAN_RETRY_MS);
 		phone_adv_resume();
 		schedule_xbox_scan_retry(XBOX_SCAN_RETRY_MS);
 		return;
@@ -489,18 +505,19 @@ static void log_bonded_xbox_boot(void)
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	if (!bonded_xbox_valid) {
-		printk("No bonded Xbox — first HID gamepad in range will be paired\n");
+		HUB_INF_M(HUB_MOD_HID, "No bonded Xbox — first HID gamepad in range will be paired\n");
 		return;
 	}
 
 	bt_addr_le_to_str(&bonded_xbox_addr, addr, sizeof(addr));
-	printk("Bonded Xbox: %s (Hub ignores other controllers)\n", addr);
-	printk("Press Button 2 to forget and pair a different controller\n");
+	HUB_INF_M(HUB_MOD_XBOX, "Bonded Xbox: %s (Hub ignores other controllers)\n", addr);
+	HUB_INF_M(HUB_MOD_SYS, "Press Button 2 to forget and pair a different controller\n");
 }
 
 static void set_conn_led(bool on)
 {
 	(void)dk_set_led(CONN_LED, on ? 1 : 0);
+	hub_status_led_set_xbox_connected(on);
 }
 
 static uint16_t axis_to_rc(int16_t axis)
@@ -529,7 +546,7 @@ static void on_uart_status(const struct uart_rc_link_status *status, void *user_
 	k_mutex_unlock(&data_mutex);
 
 	if (esb_pair_session_active) {
-		printk("[UART<-PTX] STATUS seq=%u flags=0x%02x batt=%u R/P/Y=%d/%d/%d\n",
+		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] STATUS seq=%u flags=0x%02x batt=%u R/P/Y=%d/%d/%d\n",
 		       status->seq, status->flags, status->battery_mv, status->roll,
 		       status->pitch, status->yaw);
 	}
@@ -544,8 +561,8 @@ static void esb_pair_watchdog_handler(struct k_work *work)
 	}
 
 	esb_pair_session_active = false;
-	printk("[PAIR] watchdog: no PTX pair-done within %d ms\n", ESB_PAIR_WATCHDOG_MS);
-	printk("[PAIR] check: PRX in pair mode? PTX UART logs above? ESB RF link?\n");
+	HUB_ERR_M(HUB_MOD_ESB, "[PAIR] watchdog: no PTX pair-done within %d ms\n", ESB_PAIR_WATCHDOG_MS);
+	HUB_DBG_M(HUB_MOD_ESB, "[PAIR] check: PRX in pair mode? PTX UART logs above? ESB RF link?\n");
 }
 
 static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
@@ -554,11 +571,11 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 
 	ARG_UNUSED(user_data);
 
-	printk("[UART<-PTX] ESB_RSP seq=%u cmd=%s(0x%02x) status=%d data_len=%u\n",
+	HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP seq=%u cmd=%s(0x%02x) status=%d data_len=%u\n",
 	       rsp->seq, uart_esb_cmd_name(rsp->cmd), rsp->cmd, rsp->status, rsp->data_len);
 
 	if (rsp->status != 0) {
-		printk("[UART<-PTX] ESB_RSP FAILED\n");
+		HUB_ERR_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP FAILED\n");
 		if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
 			esb_pair_session_active = false;
 			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
@@ -575,12 +592,12 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 			uart_paired_cfg_valid = true;
 			uart_log_esb_cfg(&cfg);
 			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
-				printk("[PAIR] PTX accepted PAIR — waiting OTA PRX ACK (max 30s)\n");
-				printk("[PAIR] Ensure esb_prx is in pair mode "
+				HUB_DBG_M(HUB_MOD_ESB, "[PAIR] PTX accepted PAIR — waiting OTA PRX ACK (max 30s)\n");
+				HUB_DBG_M(HUB_MOD_ESB, "[PAIR] Ensure esb_prx is in pair mode "
 				       "(no saved cfg, or hold PRX Btn4 5s)\n");
 			}
 		} else {
-			printk("[UART<-PTX] ESB_RSP cfg decode failed (len=%u need=%u)\n",
+			HUB_ERR_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP cfg decode failed (len=%u need=%u)\n",
 			       rsp->data_len, (unsigned int)sizeof(cfg));
 			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
 				esb_pair_session_active = false;
@@ -589,13 +606,13 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 		}
 		break;
 	case UART_RC_ESB_CMD_SET_ADDR:
-		printk("[UART<-PTX] addresses staged\n");
+		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] addresses staged\n");
 		break;
 	case UART_RC_ESB_CMD_APPLY:
-		printk("[UART<-PTX] radio applied\n");
+		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] radio applied\n");
 		break;
 	case UART_RC_ESB_CMD_SAVE:
-		printk("[UART<-PTX] config saved\n");
+		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] config saved\n");
 		break;
 	default:
 		break;
@@ -608,9 +625,9 @@ static void on_uart_debug_log(const struct uart_rc_debug_log *log, void *user_da
 
 	ARG_UNUSED(user_data);
 
-	printk("[PTX-LOG:%u] %.*s", log->level, log->text_len, log->text);
+	HUB_DBG_M(HUB_MOD_UART, "[PTX-LOG:%u] %.*s", log->level, log->text_len, log->text);
 	if ((log->flags & UART_RC_DEBUG_FLAG_MORE) == 0U) {
-		printk("\n");
+		HUB_DBG_M(HUB_MOD_SYS, "\n");
 	}
 
 	/* PTX reports pair result via forwarded log lines. */
@@ -628,11 +645,11 @@ static void on_uart_debug_log(const struct uart_rc_debug_log *log, void *user_da
 		    strstr(line, "PAIR broadcast ended") != NULL) {
 			esb_pair_session_active = false;
 			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
-			printk("[PAIR] session complete (from PTX log)\n");
+			HUB_DBG_M(HUB_MOD_ESB, "[PAIR] session complete (from PTX log)\n");
 		} else if (strstr(line, "PAIR broadcast timed out") != NULL) {
 			esb_pair_session_active = false;
 			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
-			printk("[PAIR] session failed: PTX timed out waiting for PRX ACK\n");
+			HUB_ERR_M(HUB_MOD_ESB, "[PAIR] session failed: PTX timed out waiting for PRX ACK\n");
 		}
 	}
 }
@@ -650,12 +667,12 @@ static int uart_hub_send_esb_req(uint8_t cmd, const uint8_t *data, uint8_t data_
 		memcpy(req.data, data, data_len);
 	}
 
-	printk("[UART->PTX] ESB_REQ seq=%u cmd=%s(0x%02x) data_len=%u\n",
+	HUB_DBG_M(HUB_MOD_UART, "[UART->PTX] ESB_REQ seq=%u cmd=%s(0x%02x) data_len=%u\n",
 	       req.seq, uart_esb_cmd_name(cmd), cmd, data_len);
 
 	err = uart_rc_link_send_esb_req(&uart_link, &req);
 	if (err != 0) {
-		printk("[UART->PTX] ESB_REQ send failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_UART, "[UART->PTX] ESB_REQ send failed: %d\n", err);
 	}
 	return err;
 }
@@ -714,18 +731,18 @@ static void uart_hub_trigger_esb_ptx_pair(void)
 	/* Stream PTX pair logs to Hub console during the session. */
 	uart_debug_forward_enabled = true;
 	err = uart_hub_send_debug_ctrl(UART_RC_DEBUG_FLAG_FORWARD, LOG_LEVEL_WRN);
-	printk("[PAIR] enable PTX log forward (err=%d)\n", err);
+	HUB_DBG_M(HUB_MOD_ESB, "[PAIR] enable PTX log forward (err=%d)\n", err);
 
 	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_PAIR, NULL, 0U);
 	if (err != 0) {
 		esb_pair_session_active = false;
-		printk("[PAIR] ESB_REQ PAIR send failed (err %d)\n", err);
+		HUB_ERR_M(HUB_MOD_ESB, "[PAIR] ESB_REQ PAIR send failed (err %d)\n", err);
 		return;
 	}
 
 	(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
 	k_work_schedule(&esb_pair_watchdog_work, K_MSEC(ESB_PAIR_WATCHDOG_MS));
-	printk("[PAIR] waiting for PTX ESB_RSP + OTA PRX ACK...\n");
+	HUB_DBG_M(HUB_MOD_ESB, "[PAIR] waiting for PTX ESB_RSP + OTA PRX ACK...\n");
 }
 
 static void uart_hub_trigger_esb_prx_pair(void)
@@ -733,17 +750,17 @@ static void uart_hub_trigger_esb_prx_pair(void)
 	int err;
 
 	if (!uart_paired_cfg_valid) {
-		printk("No PTX pair data — press Btn4 (pair PTX) first\n");
+		HUB_ERR_M(HUB_MOD_ESB, "No PTX pair data — press Btn4 (pair PTX) first\n");
 		return;
 	}
 
 	err = uart_hub_sync_esb_config(&uart_paired_cfg);
 	if (err != 0) {
-		printk("ESB PRX pair/sync failed (err %d)\n", err);
+		HUB_ERR_M(HUB_MOD_ESB, "ESB PRX pair/sync failed (err %d)\n", err);
 		return;
 	}
 
-	printk("ESB PRX pair/sync started (SET_ADDR/APPLY/SAVE on UART device)\n");
+	HUB_INF_M(HUB_MOD_ESB, "ESB PRX pair/sync started (SET_ADDR/APPLY/SAVE on UART device)\n");
 }
 
 static void esb_ptx_hold_handler(struct k_work *work)
@@ -764,7 +781,7 @@ static void esb_debug_hold_handler(struct k_work *work)
 	uart_debug_forward_enabled = !uart_debug_forward_enabled;
 	flags = uart_debug_forward_enabled ? UART_RC_DEBUG_FLAG_FORWARD : 0U;
 	(void)uart_hub_send_debug_ctrl(flags, LOG_LEVEL_INF);
-	printk("ESB debug forward %s (Btn3 long press)\n",
+	HUB_INF_M(HUB_MOD_ESB, "ESB debug forward %s (Btn3 long press)\n",
 	       uart_debug_forward_enabled ? "on" : "off");
 }
 
@@ -829,7 +846,7 @@ static int uart_link_init(void)
 		return err;
 	}
 
-	printk("UART RC link on uart30 (HDLC 0x%02x)\n", UART_RC_LINK_HDLC_FLAG);
+	HUB_INF_M(HUB_MOD_UART, "UART RC link on uart30 (HDLC 0x%02x)\n", UART_RC_LINK_HDLC_FLAG);
 	return 0;
 }
 
@@ -951,7 +968,7 @@ static ssize_t cfg_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *att
 		if (err) {
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
-		printk("Config updated: telemetry_interval_ms=%u\n", telemetry_interval_ms);
+		HUB_INF_M(HUB_MOD_PHONE, "Config updated: telemetry_interval_ms=%u\n", telemetry_interval_ms);
 		return len;
 	}
 
@@ -971,7 +988,7 @@ static void telemetry_work_handler(struct k_work *work)
 
 	err = bt_gatt_notify(NULL, &hub_svc.attrs[2], &snapshot, sizeof(snapshot));
 	if (err && err != -ENOTCONN && err != -EAGAIN) {
-		printk("Telemetry notify failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_PHONE, "Telemetry notify failed: %d\n", err);
 	}
 
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
@@ -992,10 +1009,16 @@ static ssize_t power_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *at
 
 static void power_work_handler(struct k_work *work)
 {
+	static uint8_t last_charge_state = 0xFFU;
+	static uint8_t last_fault = 0xFFU;
+	static bool last_vbus;
 	struct bq25895_status st;
 	struct hub_power_payload payload = {
 		.version = 1U,
 	};
+	uint32_t next_ms = POWER_HEARTBEAT_IDLE_MS;
+	bool charging;
+	bool state_changed;
 	int err;
 
 	ARG_UNUSED(work);
@@ -1018,12 +1041,42 @@ static void power_work_handler(struct k_work *work)
 		payload.vbus_mv = st.vbus_mv;
 		payload.charge_ma = st.charge_ma;
 
-		printk("BQ25895 batt=%umV %u%% sys=%umV vbus=%umV(%s) ichg=%umA %s\n",
-		       st.batt_mv, st.battery_pct, st.sys_mv, st.vbus_mv,
-		       bq25895_vbus_state_str(st.vbus_state), st.charge_ma,
-		       bq25895_charge_state_str(st.charge_state));
+		charging = (st.charge_state == BQ25895_CHG_PRE_CHARGE) ||
+			   (st.charge_state == BQ25895_CHG_FAST_CHARGING) ||
+			   (st.vbus_present && st.charge_state != BQ25895_CHG_NOT_CHARGING);
+		/*
+		 * While VBUS is present (plug / charge / done), poll faster so
+		 * the phone GATT Power notify tracks voltage/current live.
+		 */
+		if (st.vbus_present || charging) {
+			next_ms = POWER_HEARTBEAT_CHARGING_MS;
+		}
+
+		state_changed = (st.charge_state != last_charge_state) ||
+				(st.vbus_present != last_vbus) ||
+				(st.fault != last_fault);
+		if (state_changed) {
+			HUB_INF_M(HUB_MOD_BQ,
+				  "BQ25895 batt=%umV %u%% sys=%umV vbus=%umV(%s) ichg=%umA %s\n",
+				  st.batt_mv, st.battery_pct, st.sys_mv, st.vbus_mv,
+				  bq25895_vbus_state_str(st.vbus_state), st.charge_ma,
+				  bq25895_charge_state_str(st.charge_state));
+			if (st.fault != 0U) {
+				HUB_WRN_M(HUB_MOD_BQ,
+					  "BQ25895 FAULT REG0C=0x%02x (STAT 1Hz blink)\n",
+					  st.fault);
+			}
+			last_charge_state = (uint8_t)st.charge_state;
+			last_vbus = st.vbus_present;
+			last_fault = st.fault;
+		} else if (next_ms == POWER_HEARTBEAT_CHARGING_MS) {
+			HUB_DBG_M(HUB_MOD_BQ,
+				  "BQ25895 live batt=%umV %u%% ichg=%umA %s\n",
+				  st.batt_mv, st.battery_pct, st.charge_ma,
+				  bq25895_charge_state_str(st.charge_state));
+		}
 	} else {
-		printk("BQ25895 read failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_BQ, "BQ25895 read failed: %d\n", err);
 	}
 
 	k_mutex_lock(&data_mutex, K_FOREVER);
@@ -1033,19 +1086,32 @@ static void power_work_handler(struct k_work *work)
 	err = bt_gatt_notify(NULL, &hub_svc.attrs[HUB_PWR_VALUE_ATTR_IDX],
 			     &payload, sizeof(payload));
 	if (err && err != -ENOTCONN && err != -EAGAIN) {
-		printk("Power notify failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_BQ, "Power notify failed: %d\n", err);
 	}
 
-	k_work_schedule(&power_work, K_MSEC(POWER_SAMPLE_INTERVAL_MS));
+	k_work_schedule(&power_work, K_MSEC(next_ms));
+}
+
+static void bq25895_on_int(void)
+{
+	/* INT path: sample ASAP; also resets the heartbeat timer. */
+	(void)k_work_reschedule(&power_work, K_NO_WAIT);
 }
 
 static void power_monitor_start(void)
 {
-	int err = bq25895_init();
+	int err;
 
+	bq25895_set_event_cb(bq25895_on_int);
+
+	err = bq25895_init();
 	if (err || !bq25895_available()) {
-		printk("BQ25895 unavailable (err %d) — power status disabled\n", err);
+		HUB_ERR_M(HUB_MOD_BQ, "BQ25895 unavailable (err %d) — power status disabled\n", err);
 		return;
+	}
+
+	if (!bq25895_irq_ready()) {
+		HUB_WRN_M(HUB_MOD_BQ, "BQ25895 INT not armed — heartbeat-only sampling\n");
 	}
 
 	k_work_init_delayable(&power_work, power_work_handler);
@@ -1084,11 +1150,11 @@ static void log_raw_report(uint8_t report_id, const uint8_t *data, uint16_t len)
 {
 	uint16_t i;
 
-	printk("raw report id=%u len=%u:", report_id, len);
+	HUB_DBG_M(HUB_MOD_HID, "raw report id=%u len=%u:", report_id, len);
 	for (i = 0; i < len; i++) {
-		printk(" %02x", data[i]);
+		HUB_DBG_M(HUB_MOD_SYS, " %02x", data[i]);
 	}
-	printk("\n");
+	HUB_DBG_M(HUB_MOD_SYS, "\n");
 }
 
 static void input_report_cb(uint8_t report_id, const uint8_t *data,
@@ -1108,8 +1174,8 @@ static void input_report_cb(uint8_t report_id, const uint8_t *data,
 		char addr[BT_ADDR_LE_STR_LEN];
 
 		bt_addr_le_to_str(bt_conn_get_dst(hids.conn), addr, sizeof(addr));
-		printk("Receiving Xbox input from %s\n", addr);
-		printk("Xbox link ready on %s — Sync LED should stop on THIS controller\n",
+		HUB_INF_M(HUB_MOD_XBOX, "Receiving Xbox input from %s\n", addr);
+		HUB_INF_M(HUB_MOD_XBOX, "Xbox link ready on %s — Sync LED should stop on THIS controller\n",
 		       addr);
 		xbox_input_logged = true;
 	}
@@ -1160,7 +1226,7 @@ static void scan_filter_match(struct bt_scan_device_info *device_info,
 	if (err != 0) {
 		xbox_connecting = false;
 		xbox_link_setup = false;
-		printk("Xbox connect failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_XBOX, "Xbox connect failed: %d\n", err);
 		phone_adv_resume();
 		restart_scan();
 		return;
@@ -1173,7 +1239,7 @@ static void scan_filter_match(struct bt_scan_device_info *device_info,
 static void scan_connecting_error(struct bt_scan_device_info *device_info)
 {
 	ARG_UNUSED(device_info);
-	printk("Connection attempt failed\n");
+	HUB_ERR_M(HUB_MOD_XBOX, "Connection attempt failed\n");
 	xbox_link_failed_retry(BT_HCI_ERR_CONN_FAIL_TO_ESTAB);
 }
 
@@ -1205,7 +1271,7 @@ static void scan_filter_no_match(struct bt_scan_device_info *device_info,
 	}
 
 	bt_addr_le_to_str(device_info->recv_info->addr, addr, sizeof(addr));
-	printk("Direct advertising from %s\n", addr);
+	HUB_INF_M(HUB_MOD_PHONE, "Direct advertising from %s\n", addr);
 	bt_scan_stop();
 	xbox_connecting = true;
 	xbox_link_setup = true;
@@ -1219,7 +1285,7 @@ static void scan_filter_no_match(struct bt_scan_device_info *device_info,
 		bt_conn_unref(conn);
 	} else {
 		xbox_connecting = false;
-		printk("Direct connect failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_XBOX, "Direct connect failed: %d\n", err);
 		xbox_link_failed_retry(BT_HCI_ERR_CONN_FAIL_TO_ESTAB);
 	}
 }
@@ -1234,9 +1300,9 @@ static void xbox_activate_done_cb(int err, void *user_data)
 	xbox_link_setup = false;
 
 	if (err != 0) {
-		printk("HID activate failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_HID, "HID activate failed: %d\n", err);
 	} else {
-		printk("Xbox HID ready — resuming phone advertising\n");
+		HUB_INF_M(HUB_MOD_PHONE, "Xbox HID ready — resuming phone advertising\n");
 	}
 
 	phone_adv_resume();
@@ -1249,17 +1315,17 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 	ARG_UNUSED(context);
 
 	discovery_active = false;
-	printk("GATT discovery completed\n");
+	HUB_DBG_M(HUB_MOD_HID, "GATT discovery completed\n");
 
 	err = xbox_hids_setup(dm, &hids, input_report_cb, NULL);
 	if (err) {
-		printk("HID client setup failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_HID, "HID client setup failed: %d\n", err);
 		goto release_dm;
 	}
 
 	err = xbox_hids_activate(&hids, xbox_activate_done_cb, NULL);
 	if (err) {
-		printk("HID activate start failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_HID, "HID activate start failed: %d\n", err);
 		xbox_link_setup = false;
 		phone_adv_resume();
 	}
@@ -1267,7 +1333,7 @@ static void discovery_completed_cb(struct bt_gatt_dm *dm, void *context)
 release_dm:
 	err = bt_gatt_dm_data_release(dm);
 	if (err) {
-		printk("Discovery data release failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_HID, "Discovery data release failed: %d\n", err);
 	}
 }
 
@@ -1277,7 +1343,7 @@ static void discovery_service_not_found_cb(struct bt_conn *conn, void *context)
 	ARG_UNUSED(context);
 	discovery_active = false;
 	xbox_link_setup = false;
-	printk("HID service not found\n");
+	HUB_ERR_M(HUB_MOD_HID, "HID service not found\n");
 	phone_adv_resume();
 }
 
@@ -1287,7 +1353,7 @@ static void discovery_error_found_cb(struct bt_conn *conn, int err, void *contex
 	ARG_UNUSED(context);
 	discovery_active = false;
 	xbox_link_setup = false;
-	printk("GATT discovery failed: %d\n", err);
+	HUB_ERR_M(HUB_MOD_HID, "GATT discovery failed: %d\n", err);
 	phone_adv_resume();
 }
 
@@ -1309,7 +1375,7 @@ static void gatt_discover(struct bt_conn *conn)
 	err = bt_gatt_dm_start(conn, BT_UUID_HIDS, &discovery_cb, NULL);
 	if (err) {
 		discovery_active = false;
-		printk("Discovery start failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_HID, "Discovery start failed: %d\n", err);
 	}
 }
 
@@ -1318,7 +1384,7 @@ static void restart_scan(void)
 	int err = bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE);
 
 	if (err) {
-		printk("Scan restart failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_XBOX, "Scan restart failed: %d\n", err);
 	}
 }
 
@@ -1355,7 +1421,7 @@ static void adv_guard_work_handler(struct k_work *work)
 	}
 
 	if (adv_start() != 0) {
-		printk("Phone advertising guard failed\n");
+		HUB_ERR_M(HUB_MOD_PHONE, "Phone advertising guard failed\n");
 	}
 
 	k_work_schedule(&adv_guard_work, K_SECONDS(2));
@@ -1374,12 +1440,12 @@ static void adv_restart_work_handler(struct k_work *work)
 	err = adv_start();
 	if (!err) {
 		adv_restart_attempts = 0U;
-		printk("Phone advertising restarted\n");
+		HUB_INF_M(HUB_MOD_PHONE, "Phone advertising restarted\n");
 		return;
 	}
 
 	adv_restart_attempts++;
-	printk("Phone advertising restart failed: %d (attempt %u)\n",
+	HUB_ERR_M(HUB_MOD_PHONE, "Phone advertising restart failed: %d (attempt %u)\n",
 	       err, adv_restart_attempts);
 
 	if (adv_restart_attempts < 10U) {
@@ -1395,7 +1461,7 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	if (conn_err) {
-		printk("Connect failed %s: 0x%02x %s\n", addr, conn_err,
+		HUB_ERR_M(HUB_MOD_XBOX, "Connect failed %s: 0x%02x %s\n", addr, conn_err,
 		       bt_hci_err_to_str(conn_err));
 		if (conn == default_conn) {
 			bt_conn_unref(default_conn);
@@ -1410,11 +1476,11 @@ static void connected(struct bt_conn *conn, uint8_t conn_err)
 		adv_running = false;
 		adv_restart_attempts = 0U;
 		k_work_cancel_delayable(&adv_restart_work);
-		printk("Phone connected: %s\n", addr);
+		HUB_INF_M(HUB_MOD_PHONE, "Phone connected: %s\n", addr);
 		return;
 	}
 
-	printk("Xbox connected: %s\n", addr);
+	HUB_INF_M(HUB_MOD_XBOX, "Xbox connected: %s\n", addr);
 	xbox_connecting = false;
 	xbox_link_setup = true;
 	set_conn_led(true);
@@ -1438,14 +1504,15 @@ static void disconnected(struct bt_conn *conn, uint8_t reason)
 		bt_conn_unref(phone_conn);
 		phone_conn = NULL;
 		adv_running = false;
-		printk("Phone disconnected: %s reason 0x%02x %s\n", addr, reason,
+		hub_ble_log_on_phone_disconnect();
+		HUB_INF_M(HUB_MOD_PHONE, "Phone disconnected: %s reason 0x%02x %s\n", addr, reason,
 		       bt_hci_err_to_str(reason));
 		adv_restart_attempts = 0U;
 		k_work_schedule(&adv_restart_work, K_MSEC(200));
 		return;
 	}
 
-	printk("Xbox disconnected: %s reason 0x%02x %s\n", addr, reason,
+	HUB_INF_M(HUB_MOD_XBOX, "Xbox disconnected: %s reason 0x%02x %s\n", addr, reason,
 	       bt_hci_err_to_str(reason));
 	set_conn_led(false);
 	discovery_active = false;
@@ -1468,9 +1535,9 @@ static void security_changed(struct bt_conn *conn, bt_security_t level,
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
 
 	if (!err) {
-		printk("Security changed: %s level %u\n", addr, level);
+		HUB_INF_M(HUB_MOD_XBOX, "Security changed: %s level %u\n", addr, level);
 	} else {
-		printk("Security failed: %s level %u err %d %s\n", addr, level,
+		HUB_ERR_M(HUB_MOD_XBOX, "Security failed: %s level %u err %d %s\n", addr, level,
 		       err, bt_security_err_to_str(err));
 		if (err == BT_SECURITY_ERR_PIN_OR_KEY_MISSING ||
 		    err == BT_SECURITY_ERR_AUTH_FAIL ||
@@ -1511,13 +1578,13 @@ static void scan_init(void)
 
 	err = bt_scan_filter_add(BT_SCAN_FILTER_TYPE_UUID, BT_UUID_HIDS);
 	if (err) {
-		printk("UUID filter setup failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_SYS, "UUID filter setup failed: %d\n", err);
 		return;
 	}
 
 	err = bt_scan_filter_enable(BT_SCAN_UUID_FILTER, false);
 	if (err) {
-		printk("UUID filter enable failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_SYS, "UUID filter enable failed: %d\n", err);
 	}
 }
 
@@ -1525,10 +1592,10 @@ static void num_comp_reply(bool accept)
 {
 	if (accept) {
 		bt_conn_auth_passkey_confirm(auth_conn);
-		printk("Pairing accepted\n");
+		HUB_INF_M(HUB_MOD_PHONE, "Pairing accepted\n");
 	} else {
 		bt_conn_auth_cancel(auth_conn);
-		printk("Pairing rejected\n");
+		HUB_ERR_M(HUB_MOD_PHONE, "Pairing rejected\n");
 	}
 
 	bt_conn_unref(auth_conn);
@@ -1586,6 +1653,13 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 		}
 	}
 
+	/* Btn1 (when not pairing): dump BQ25895 registers over console. */
+	if ((button & KEY_PAIRING_ACCEPT) != 0U && auth_conn == NULL &&
+	    (button_state & KEY_PAIRING_ACCEPT) != 0U) {
+		HUB_FORCE("Button1: BQ25895 register dump\n");
+		bq25895_log_dump();
+	}
+
 	if (!auth_conn) {
 		return;
 	}
@@ -1600,7 +1674,7 @@ static void auth_passkey_display(struct bt_conn *conn, unsigned int passkey)
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Passkey for %s: %06u\n", addr, passkey);
+	HUB_INF_M(HUB_MOD_PHONE, "Passkey for %s: %06u\n", addr, passkey);
 }
 
 static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
@@ -1608,7 +1682,7 @@ static void auth_passkey_confirm(struct bt_conn *conn, unsigned int passkey)
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Auto-confirm passkey for %s: %06u\n", addr, passkey);
+	HUB_INF_M(HUB_MOD_PHONE, "Auto-confirm passkey for %s: %06u\n", addr, passkey);
 	(void)bt_conn_auth_passkey_confirm(conn);
 }
 
@@ -1617,7 +1691,7 @@ static void auth_cancel(struct bt_conn *conn)
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Pairing cancelled: %s\n", addr);
+	HUB_WRN_M(HUB_MOD_PHONE, "Pairing cancelled: %s\n", addr);
 }
 
 static void pairing_complete(struct bt_conn *conn, bool bonded)
@@ -1626,13 +1700,13 @@ static void pairing_complete(struct bt_conn *conn, bool bonded)
 	const bt_addr_le_t *dst = bt_conn_get_dst(conn);
 
 	bt_addr_le_to_str(dst, addr, sizeof(addr));
-	printk("Pairing complete: %s bonded=%d\n", addr, bonded);
+	HUB_INF_M(HUB_MOD_PHONE, "Pairing complete: %s bonded=%d\n", addr, bonded);
 
 	if (bonded) {
 		bonded_xbox_store(dst);
-		printk("Hub bonded to %s — Sync LED on THIS controller should stop blinking\n",
+		HUB_INF_M(HUB_MOD_XBOX, "Hub bonded to %s — Sync LED on THIS controller should stop blinking\n",
 		       addr);
-		printk("If your controller still blinks, its MAC is different; press Button 2\n");
+		HUB_INF_M(HUB_MOD_SYS, "If your controller still blinks, its MAC is different; press Button 2\n");
 	}
 }
 
@@ -1641,7 +1715,7 @@ static void pairing_failed(struct bt_conn *conn, enum bt_security_err reason)
 	char addr[BT_ADDR_LE_STR_LEN];
 
 	bt_addr_le_to_str(bt_conn_get_dst(conn), addr, sizeof(addr));
-	printk("Pairing failed: %s reason %d %s\n", addr, reason,
+	HUB_ERR_M(HUB_MOD_PHONE, "Pairing failed: %s reason %d %s\n", addr, reason,
 	       bt_security_err_to_str(reason));
 
 	if (reason == BT_SECURITY_ERR_PIN_OR_KEY_MISSING ||
@@ -1673,8 +1747,16 @@ int main(void)
 {
 	int err;
 
-	printk("Ground BLE Hub (Xbox + Phone) on nRF54L15\n");
-	printk("Put Xbox controller in pairing mode (hold Sync).\n");
+	err = hub_flash_log_init();
+	if (err) {
+		HUB_FORCE("hub flash log init failed: %d (HUB_* UART-only)\n", err);
+		hub_log_uart_mirror = true;
+	}
+	hub_ble_log_init();
+	hub_ble_log_bind(&hub_svc.attrs[HUB_LOGDATA_VALUE_ATTR_IDX]);
+
+	HUB_INF_M(HUB_MOD_PHONE, "Ground BLE Hub (Xbox + Phone) on nRF54L15\n");
+	HUB_INF_M(HUB_MOD_PHONE, "Put Xbox controller in pairing mode (hold Sync).\n");
 
 	xbox_hids_init(&hids);
 	k_work_init_delayable(&telemetry_work, telemetry_work_handler);
@@ -1693,22 +1775,22 @@ int main(void)
 
 	err = bt_conn_auth_cb_register(&conn_auth_callbacks);
 	if (err) {
-		printk("Auth callback register failed\n");
+		HUB_ERR_M(HUB_MOD_PHONE, "Auth callback register failed\n");
 		return 0;
 	}
 
 	err = bt_conn_auth_info_cb_register(&conn_auth_info_callbacks);
 	if (err) {
-		printk("Auth info callback register failed\n");
+		HUB_ERR_M(HUB_MOD_PHONE, "Auth info callback register failed\n");
 		return 0;
 	}
 
 	err = bt_enable(NULL);
 	if (err) {
-		printk("Bluetooth init failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_SYS, "Bluetooth init failed: %d\n", err);
 		return 0;
 	}
-	printk("Bluetooth initialized\n");
+	HUB_INF_M(HUB_MOD_SYS, "Bluetooth initialized\n");
 
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		settings_load();
@@ -1719,31 +1801,36 @@ int main(void)
 
 	err = dk_leds_init();
 	if (err) {
-		printk("LED init failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_SYS, "LED init failed: %d\n", err);
 		return 0;
+	}
+
+	err = hub_status_led_init();
+	if (err && err != -ENOENT) {
+		HUB_WRN_M(HUB_MOD_SYS, "status LED init failed: %d\n", err);
 	}
 
 	err = dk_buttons_init(button_handler);
 	if (err) {
-		printk("Button init failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_SYS, "Button init failed: %d\n", err);
 		return 0;
 	}
 
 	err = adv_start();
 	if (err) {
-		printk("Advertising start failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_PHONE, "Advertising start failed: %d\n", err);
 		return 0;
 	}
 
 	err = bt_scan_start(BT_SCAN_TYPE_SCAN_ACTIVE);
 	if (err) {
-		printk("Scan start failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_XBOX, "Scan start failed: %d\n", err);
 		return 0;
 	}
 
 	err = uart_link_init();
 	if (err) {
-		printk("UART link init failed: %d\n", err);
+		HUB_ERR_M(HUB_MOD_UART, "UART link init failed: %d\n", err);
 		return 0;
 	}
 
@@ -1755,9 +1842,11 @@ int main(void)
 
 	/* BQ25895 is optional — never blocks BLE if absent. */
 	power_monitor_start();
-	printk("Scanning Xbox, advertising to phone, UART link enabled\n");
-	printk("UART CTRL heartbeat %u ms while Xbox connected\n",
+	HUB_INF_M(HUB_MOD_UART, "Scanning Xbox, advertising to phone, UART link enabled\n");
+	HUB_INF_M(HUB_MOD_UART, "UART CTRL heartbeat %u ms while Xbox connected\n",
 	       UART_CTRL_HEARTBEAT_MS);
-	printk("Btn3: ESB PRX UART sync | Btn3 hold 1.5s: debug log | Btn4 hold 1.5s: ESB OTA pair\n");
+	HUB_INF_M(HUB_MOD_BQ, "Btn1: dump BQ25895 regs | Btn3: ESB PRX UART sync | "
+	       "Btn3 hold: debug log | Btn4 hold: ESB OTA pair\n");
+	HUB_FORCE("Shell ready — flog show | loglevel | bq dump\n");
 	return 0;
 }

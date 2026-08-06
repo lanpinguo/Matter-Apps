@@ -9,7 +9,9 @@
 #include <bluetooth/services/hids.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/bluetooth/uuid.h>
-#include <zephyr/sys/printk.h>
+#include "hub_log.h"
+
+HUB_LOG_MODULE_DEFINE(HUB_MOD_HID);
 
 enum xbox_hids_activate_step {
 	XBOX_HIDS_ACTIVATE_REPORT_MAP,
@@ -105,13 +107,13 @@ static int report_add(struct xbox_hids *hids, const struct bt_gatt_dm *dm,
 
 	ccc_desc = bt_gatt_dm_desc_by_uuid(dm, chrc_attr, BT_UUID_GATT_CCC);
 	if (!ccc_desc) {
-		printk("Input report missing CCC (index %u)\n", index);
+		HUB_ERR("Input report missing CCC (index %u)\n", index);
 		return 0;
 	}
 
 	value_handle = chrc_value_handle_get(dm, chrc_attr);
 	if (value_handle == 0U) {
-		printk("Input report missing value handle (index %u)\n", index);
+		HUB_ERR("Input report missing value handle (index %u)\n", index);
 		return 0;
 	}
 
@@ -123,7 +125,7 @@ static int report_add(struct xbox_hids *hids, const struct bt_gatt_dm *dm,
 	hids->report_count++;
 
 	bt_uuid_to_str(chrc->uuid, uuid_str, sizeof(uuid_str));
-	printk("Found input report #%u uuid=%s val=0x%04x ccc=0x%04x props=0x%02x\n",
+	HUB_DBG("Found input report #%u uuid=%s val=0x%04x ccc=0x%04x props=0x%02x\n",
 	       rep->report_id, uuid_str, rep->value_handle, rep->ccc_handle,
 	       chrc->properties);
 
@@ -153,7 +155,7 @@ int xbox_hids_setup(struct bt_gatt_dm *dm, struct xbox_hids *hids,
 			if (handle != 0U) {
 				hids->info_handle = handle;
 				hids->info_valid = true;
-				printk("Found HID information val=0x%04x\n", handle);
+				HUB_DBG("Found HID information val=0x%04x\n", handle);
 			}
 			continue;
 		}
@@ -164,7 +166,7 @@ int xbox_hids_setup(struct bt_gatt_dm *dm, struct xbox_hids *hids,
 			if (handle != 0U) {
 				hids->report_map_handle = handle;
 				hids->report_map_valid = true;
-				printk("Found HID report map val=0x%04x\n", handle);
+				HUB_DBG("Found HID report map val=0x%04x\n", handle);
 			}
 			continue;
 		}
@@ -175,7 +177,7 @@ int xbox_hids_setup(struct bt_gatt_dm *dm, struct xbox_hids *hids,
 			if (handle != 0U) {
 				hids->ctrl_point_handle = handle;
 				hids->ctrl_point_valid = true;
-				printk("Found HID control point val=0x%04x\n", handle);
+				HUB_DBG("Found HID control point val=0x%04x\n", handle);
 			}
 			continue;
 		}
@@ -193,7 +195,7 @@ int xbox_hids_setup(struct bt_gatt_dm *dm, struct xbox_hids *hids,
 	}
 
 	if (hids->report_count == 0U) {
-		printk("No notify-capable HID reports found\n");
+		HUB_ERR("No notify-capable HID reports found\n");
 		return -ENOENT;
 	}
 
@@ -222,12 +224,12 @@ int xbox_hids_subscribe_all(struct xbox_hids *hids)
 
 		err = bt_gatt_subscribe(hids->conn, &rep->subscribe);
 		if (err) {
-			printk("Subscribe report %u failed: %d\n",
+			HUB_ERR("Subscribe report %u failed: %d\n",
 			       rep->report_id, err);
 			continue;
 		}
 
-		printk("Subscribed to input report %u\n", rep->report_id);
+		HUB_DBG("Subscribed to input report %u\n", rep->report_id);
 		subscribed++;
 	}
 
@@ -264,7 +266,7 @@ static int activate_read_start(uint16_t handle, const char *label)
 
 	err = bt_gatt_read(activate_ctx.hids->conn, &activate_ctx.read_params);
 	if (err != 0) {
-		printk("HID %s read start failed: %d\n", label, err);
+		HUB_ERR("HID %s read start failed: %d\n", label, err);
 	}
 
 	return err;
@@ -277,7 +279,7 @@ static void activate_subscribe_finish(void)
 	(void)xbox_hids_exit_suspend(activate_ctx.hids);
 	err = xbox_hids_subscribe_all(activate_ctx.hids);
 	if (err == 0) {
-		printk("HID activate done\n");
+		HUB_INF("HID activate done\n");
 	}
 	activate_finish(err);
 }
@@ -313,7 +315,7 @@ static uint8_t activate_read_cb(struct bt_conn *conn, uint8_t err,
 	ARG_UNUSED(length);
 
 	if (err != 0) {
-		printk("HID activate read step %u failed: %u\n", activate_ctx.step, err);
+		HUB_ERR("HID activate read step %u failed: %u\n", activate_ctx.step, err);
 	}
 
 	activate_ctx.step++;
@@ -387,7 +389,7 @@ int xbox_hids_exit_suspend(struct xbox_hids *hids)
 	err = bt_gatt_write_without_response(hids->conn, hids->ctrl_point_handle,
 					     &exit_suspend, sizeof(exit_suspend), false);
 	if (err != 0) {
-		printk("HID exit suspend failed: %d\n", err);
+		HUB_ERR("HID exit suspend failed: %d\n", err);
 	}
 
 	return err;
