@@ -108,7 +108,10 @@
 #define UART_RC_CH_RY              3U
 #define UART_RC_CH_LT              4U
 #define UART_RC_CH_RT              5U
-#define UART_RC_CH_COUNT_DEFAULT   6U
+#define UART_RC_CH_AUX0            6U /* Xbox A → PRX PWM CH6 */
+#define UART_RC_CH_AUX1            7U /* Xbox B → PRX PWM CH7 */
+#define UART_RC_CH_AUX2            8U /* Xbox LB → PRX PWM CH8 */
+#define UART_RC_CH_COUNT_DEFAULT   9U
 
 #define UART_RC_ESB_CMD_GET_CONFIG 0x01U
 #define UART_RC_ESB_CMD_SET_RADIO  0x02U

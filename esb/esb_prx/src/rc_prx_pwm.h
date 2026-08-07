@@ -10,7 +10,7 @@
 
 #include "rc_link.h"
 
-#define RC_PRX_PWM_CHANNEL_COUNT 5U
+#define RC_PRX_PWM_CHANNEL_COUNT 9U
 
 int rc_prx_pwm_init(void);
 

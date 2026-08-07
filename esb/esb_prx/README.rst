@@ -8,7 +8,8 @@ Features
 
 * ESB PRX mode at 2 Mbps, receives control frames from PTX
 * Sends aircraft status back to PTX inside ACK payloads
-* Five RC PWM outputs via **PCA9685** (50 Hz, 1000–2000 µs); CH4 is throttle from Xbox RT
+* Nine RC PWM outputs via **PCA9685** (50 Hz, 1000–2000 µs); CH4 is throttle from Xbox RT
+* Status LED on **P2.07**: CTRL/keepalive 0.5 Hz, channel-change flash once, lost/boot off, pair rapid
 * UART RC link on the **console UART** for ESB pair/config/save (bench setup)
 * Radio addresses persisted in flash (``esb_prx/radio`` settings key)
 * If no saved config exists, PRX enters auto-pair mode and accepts the first valid ESB ``PAIR`` frame
@@ -29,10 +30,14 @@ CH1     LED1         LY (0..1000)
 CH2     LED2         RX (0..1000)
 CH3     LED3         RY (0..1000)
 CH4     LED4         RT throttle (raw 0..1023 → 1000..2000 µs)
+CH5     LED5         LT (raw 0..1023 → 1000..2000 µs)
+CH6     LED6         AUX0 / Xbox A (0 or 1000)
+CH7     LED7         AUX1 / Xbox B (0 or 1000)
+CH8     LED8         AUX2 / Xbox LB (0 or 1000)
 ======= ============ ========================
 
 Trigger normalization (0..1023 → pulse) is done on PRX. If no CTRL frame
-arrives for 500 ms, outputs go to failsafe (sticks center, throttle low).
+arrives for 500 ms, outputs go to failsafe (sticks center, throttle/LT/AUX low).
 ``uart20`` uses TX/RX only (P1.04/P1.05). DK **SW0** is remapped off P1.13
 (SDA) to P1.02 so it does not conflict with I2C. Change ``i2c22`` pinctrl in the
 board overlay if SDA/SCL are wired differently.

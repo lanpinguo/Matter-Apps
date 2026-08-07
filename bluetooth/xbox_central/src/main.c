@@ -803,6 +803,10 @@ static void uart_send_ctrl_from_state(const struct xbox_gamepad_state *s)
 	ctrl.channels[UART_RC_CH_RY] = axis_to_rc(s->ry);
 	ctrl.channels[UART_RC_CH_LT] = s->lt;
 	ctrl.channels[UART_RC_CH_RT] = s->rt;
+	/* Aux switches: released=0, pressed=1000 (RC 3-pos mid unused). */
+	ctrl.channels[UART_RC_CH_AUX0] = s->btn_a ? 1000U : 0U;
+	ctrl.channels[UART_RC_CH_AUX1] = s->btn_b ? 1000U : 0U;
+	ctrl.channels[UART_RC_CH_AUX2] = s->btn_lb ? 1000U : 0U;
 
 	(void)uart_rc_link_send_ctrl(&uart_link, &ctrl);
 }

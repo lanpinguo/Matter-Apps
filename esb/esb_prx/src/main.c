@@ -3,6 +3,8 @@
  *
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
+#include <string.h>
+
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
 #include <zephyr/drivers/clock_control.h>
@@ -31,24 +33,24 @@
 #include "rc_link.h"
 #include "rc_prx_channels.h"
 #include "rc_prx_pwm.h"
+#include "rc_prx_status_led.h"
 #include "rc_uart_bridge.h"
 
 LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
 #define KEY_RADIO_CLEAR            DK_BTN1_MSK
 #define RADIO_CLEAR_HOLD_TIME_MS  5000
-/* Pair-mode LED: 80 ms on / 80 ms off (~6 Hz), distinct from CTRL-driven pattern. */
-#define PAIR_LED_HALF_PERIOD_MS   80
 
 static uint8_t status_seq;
 static uint8_t last_ctrl_seq;
 static uint8_t peer_ctrl_channels;
 static bool pairing_mode;
 static bool radio_clear_armed;
-static bool pair_led_on;
+static bool last_ctrl_valid;
+static uint8_t last_ctrl_count;
+static uint16_t last_ctrl_channels[RC_LINK_MAX_CHANNELS];
 static struct k_work_delayable radio_clear_work;
 static struct k_work_delayable pair_apply_work;
-static struct k_work_delayable pair_led_work;
 static struct rc_link_pair_payload pending_pair_payload;
 static bool pending_pair_valid;
 static struct esb_payload rx_payload;
@@ -58,32 +60,6 @@ static struct rc_link_frame status_frame;
 /* Leave enough time for ESB ACK on the default address before switching. */
 #define PAIR_APPLY_DELAY_MS 100
 
-static void leds_update(uint8_t value)
-{
-	uint32_t leds_mask =
-		(!(value % 8 > 0 && value % 8 <= 4) ? DK_LED1_MSK : 0) |
-		(!(value % 8 > 1 && value % 8 <= 5) ? DK_LED2_MSK : 0) |
-		(!(value % 8 > 2 && value % 8 <= 6) ? DK_LED3_MSK : 0) |
-		(!(value % 8 > 3) ? DK_LED4_MSK : 0);
-
-	dk_set_leds(leds_mask);
-}
-
-static void pair_led_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	if (!pairing_mode) {
-		pair_led_on = false;
-		dk_set_led(DK_LED1, 0);
-		return;
-	}
-
-	pair_led_on = !pair_led_on;
-	dk_set_led(DK_LED1, pair_led_on ? 1 : 0);
-	(void)k_work_reschedule(&pair_led_work, K_MSEC(PAIR_LED_HALF_PERIOD_MS));
-}
-
 static void pairing_mode_set(bool enable)
 {
 	if (pairing_mode == enable) {
@@ -91,14 +67,9 @@ static void pairing_mode_set(bool enable)
 	}
 
 	pairing_mode = enable;
+	rc_prx_status_led_set_pairing(enable);
 	if (enable) {
-		pair_led_on = false;
-		(void)k_work_reschedule(&pair_led_work, K_NO_WAIT);
-		LOG_INF("Pair LED: rapid blink on DK_LED1");
-	} else {
-		(void)k_work_cancel_delayable(&pair_led_work);
-		pair_led_on = false;
-		dk_set_led(DK_LED1, 0);
+		LOG_INF("Pair mode ON — status LED rapid blink");
 	}
 }
 
@@ -183,8 +154,39 @@ static void handle_pair_frame(const struct rc_link_frame *frame)
 	(void)k_work_schedule(&pair_apply_work, K_MSEC(PAIR_APPLY_DELAY_MS));
 }
 
+static bool ctrl_channels_changed(const struct rc_link_frame *ctrl)
+{
+	uint8_t count = ctrl->channel_count;
+
+	if (count > RC_LINK_MAX_CHANNELS) {
+		count = RC_LINK_MAX_CHANNELS;
+	}
+
+	if (!last_ctrl_valid || last_ctrl_count != count) {
+		return true;
+	}
+
+	return memcmp(last_ctrl_channels, ctrl->channels,
+		      (size_t)count * sizeof(uint16_t)) != 0;
+}
+
+static void remember_ctrl_channels(const struct rc_link_frame *ctrl)
+{
+	uint8_t count = ctrl->channel_count;
+
+	if (count > RC_LINK_MAX_CHANNELS) {
+		count = RC_LINK_MAX_CHANNELS;
+	}
+
+	last_ctrl_count = count;
+	memcpy(last_ctrl_channels, ctrl->channels, (size_t)count * sizeof(uint16_t));
+	last_ctrl_valid = true;
+}
+
 static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
 {
+	bool changed;
+
 	if (ctrl->type != RC_LINK_TYPE_CTRL) {
 		return;
 	}
@@ -199,8 +201,15 @@ static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
 	rc_link_log_channels("Control", ctrl);
 	rc_prx_pwm_apply_ctrl(ctrl);
 
-	if (!pairing_mode && ctrl->channel_count > 1U) {
-		leds_update((uint8_t)ctrl->channels[1]);
+	/*
+	 * Keepalive (same channels) only refreshes the link timer — no flash.
+	 * Flash once when sticks/buttons actually change.
+	 */
+	changed = ctrl_channels_changed(ctrl);
+	remember_ctrl_channels(ctrl);
+	rc_prx_status_led_on_link();
+	if (changed) {
+		rc_prx_status_led_on_activity();
 	}
 }
 
@@ -387,9 +396,13 @@ int main(void)
 		return 0;
 	}
 
+	err = rc_prx_status_led_init();
+	if (err) {
+		LOG_WRN("status LED init failed: %d", err);
+	}
+
 	k_work_init_delayable(&radio_clear_work, radio_clear_work_handler);
 	k_work_init_delayable(&pair_apply_work, pair_apply_work_handler);
-	k_work_init_delayable(&pair_led_work, pair_led_work_handler);
 	radio_clear_armed = false;
 	dk_buttons_init(button_handler);
 

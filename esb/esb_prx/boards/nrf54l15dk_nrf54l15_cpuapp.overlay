@@ -96,9 +96,19 @@
 	nfct-pins-as-gpios;
 };
 
+/*
+ * Override DK LED3 (DT: led2, P2.07): external status LED is active-low.
+ */
+&led2 {
+	gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+	label = "LED3 / Status LED (P2.07, active-low)";
+};
+
 / {
 	aliases {
 		pca9685 = &pca9685;
+		/* DK LED3 @ P2.07 — system status (idle slow / CTRL fast / pair rapid). */
+		status-led = &led2;
 	};
 
 	/*
@@ -119,27 +129,47 @@
 
 		rc_pwm0: rc_pwm_0 {
 			pwms = <&pca9685 0 PWM_USEC(20000)>;
-			label = "RC PWM CH0 (PCA9685 LED0)";
+			label = "RC PWM CH0 (PCA9685 LED0) LX";
 		};
 
 		rc_pwm1: rc_pwm_1 {
 			pwms = <&pca9685 1 PWM_USEC(20000)>;
-			label = "RC PWM CH1 (PCA9685 LED1)";
+			label = "RC PWM CH1 (PCA9685 LED1) LY";
 		};
 
 		rc_pwm2: rc_pwm_2 {
 			pwms = <&pca9685 2 PWM_USEC(20000)>;
-			label = "RC PWM CH2 (PCA9685 LED2)";
+			label = "RC PWM CH2 (PCA9685 LED2) RX";
 		};
 
 		rc_pwm3: rc_pwm_3 {
 			pwms = <&pca9685 3 PWM_USEC(20000)>;
-			label = "RC PWM CH3 (PCA9685 LED3)";
+			label = "RC PWM CH3 (PCA9685 LED3) RY";
 		};
 
 		rc_pwm4: rc_pwm_4 {
 			pwms = <&pca9685 4 PWM_USEC(20000)>;
 			label = "RC PWM CH4 throttle RT (PCA9685 LED4)";
+		};
+
+		rc_pwm5: rc_pwm_5 {
+			pwms = <&pca9685 5 PWM_USEC(20000)>;
+			label = "RC PWM CH5 LT (PCA9685 LED5)";
+		};
+
+		rc_pwm6: rc_pwm_6 {
+			pwms = <&pca9685 6 PWM_USEC(20000)>;
+			label = "RC PWM CH6 AUX0 A (PCA9685 LED6)";
+		};
+
+		rc_pwm7: rc_pwm_7 {
+			pwms = <&pca9685 7 PWM_USEC(20000)>;
+			label = "RC PWM CH7 AUX1 B (PCA9685 LED7)";
+		};
+
+		rc_pwm8: rc_pwm_8 {
+			pwms = <&pca9685 8 PWM_USEC(20000)>;
+			label = "RC PWM CH8 AUX2 LB (PCA9685 LED8)";
 		};
 	};
 };

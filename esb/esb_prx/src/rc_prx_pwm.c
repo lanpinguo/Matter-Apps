@@ -35,7 +35,7 @@ LOG_MODULE_REGISTER(rc_prx_pwm, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
 /*
  * PWM output i reads CTRL channel pwm_ctrl_index[i] via PCA9685 LEDi.
- * CH4 (LED4) is throttle from Xbox RT.
+ * CH4 (LED4) is throttle from Xbox RT; CH5 = LT; CH6–8 = A/B/LB aux switches.
  */
 static const uint8_t pwm_ctrl_index[RC_PRX_PWM_CHANNEL_COUNT] = {
 	UART_RC_CH_LX,
@@ -43,11 +43,15 @@ static const uint8_t pwm_ctrl_index[RC_PRX_PWM_CHANNEL_COUNT] = {
 	UART_RC_CH_RX,
 	UART_RC_CH_RY,
 	UART_RC_CH_RT,
+	UART_RC_CH_LT,
+	UART_RC_CH_AUX0,
+	UART_RC_CH_AUX1,
+	UART_RC_CH_AUX2,
 };
 
-/* Stick PWMs failsafe to center; throttle (RT) fails to low. */
+/* Sticks center; throttle/LT/aux failsafe low (1000 µs). */
 static const uint16_t failsafe_values[RC_PRX_PWM_CHANNEL_COUNT] = {
-	500U, 500U, 500U, 500U, 0U,
+	500U, 500U, 500U, 500U, 0U, 0U, 0U, 0U, 0U,
 };
 
 static const struct pwm_dt_spec rc_pwms[RC_PRX_PWM_CHANNEL_COUNT] = {
@@ -56,6 +60,10 @@ static const struct pwm_dt_spec rc_pwms[RC_PRX_PWM_CHANNEL_COUNT] = {
 	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm2)),
 	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm3)),
 	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm4)),
+	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm5)),
+	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm6)),
+	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm7)),
+	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm8)),
 };
 
 /* PCA9685 /OE is active-low (DT GPIO_ACTIVE_LOW). */
