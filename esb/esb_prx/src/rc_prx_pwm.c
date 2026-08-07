@@ -18,15 +18,20 @@
 
 LOG_MODULE_REGISTER(rc_prx_pwm, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
+#define RC_PWM_HZ           50U
 #define RC_PWM_PERIOD_NS    PWM_USEC(20000)
 #define RC_PWM_PULSE_MIN_NS PWM_USEC(1000)
 #define RC_PWM_PULSE_MAX_NS PWM_USEC(2000)
 #define RC_PWM_VALUE_MAX    1000U
 #define RC_PWM_FAILSAFE_MS  500U
 
-#define PCA9685_NODE DT_NODELABEL(pca9685)
-#define PCA9685_INIT_RETRIES 5
+#define PCA9685_NODE          DT_NODELABEL(pca9685)
+#define PCA9685_INIT_RETRIES  5
 #define PCA9685_INIT_RETRY_MS 20
+#define PCA9685_REG_PRE_SCALE 0xFE
+#define PCA9685_PWM_STEPS     4096U
+#define PCA9685_PRESCALE_MIN  0x03
+#define PCA9685_PRESCALE_MAX  0xFF
 
 /*
  * PWM output i reads CTRL channel pwm_ctrl_index[i] via PCA9685 LEDi.
@@ -62,6 +67,8 @@ static const struct i2c_dt_spec pca9685_i2c = I2C_DT_SPEC_GET(PCA9685_NODE);
 static struct k_work_delayable failsafe_work;
 static struct k_work pwm_apply_work;
 static bool pwm_ready;
+static uint32_t pca_period_count;
+static uint8_t pca_prescale;
 
 /* Latest CTRL snapshot — filled from ESB ISR, applied on system workqueue. */
 static uint16_t pending_channels[RC_LINK_MAX_CHANNELS];
@@ -101,13 +108,22 @@ static void set_pwm(uint8_t index, uint16_t value)
 {
 	int err;
 	uint32_t pulse_ns;
+	uint32_t pulse_count;
 
-	if (index >= RC_PRX_PWM_CHANNEL_COUNT || !pwm_ready) {
+	if (index >= RC_PRX_PWM_CHANNEL_COUNT || !pwm_ready || pca_period_count == 0U) {
 		return;
 	}
 
+	/*
+	 * Use pwm_set_cycles with a period_count that matches the calibrated
+	 * PRE_SCALE. Do not use pwm_set()/pwm_set_dt() — those assume the
+	 * driver's hardcoded 25 MHz OSC and produced ~55 Hz on this board.
+	 */
 	pulse_ns = value_to_pulse_ns(value);
-	err = pwm_set_dt(&rc_pwms[index], RC_PWM_PERIOD_NS, pulse_ns);
+	pulse_count = (uint32_t)(((uint64_t)pulse_ns * pca_period_count) /
+				 RC_PWM_PERIOD_NS);
+	err = pwm_set_cycles(rc_pwms[index].dev, rc_pwms[index].channel,
+			     pca_period_count, pulse_count, rc_pwms[index].flags);
 	if (err != 0) {
 		LOG_DBG("PWM%u set failed: %d", index, err);
 	}
@@ -209,6 +225,56 @@ static int pca9685_bringup(void)
 	return err != 0 ? err : -ENODEV;
 }
 
+/*
+ * Datasheet 7.3.5: update_rate = OSC / (4096 × (PRE_SCALE + 1)).
+ * Program PRE_SCALE from the calibrated OSC (CONFIG_RC_PCA9685_OSC_HZ).
+ */
+static int pca9685_configure_rate(uint32_t hz)
+{
+	uint64_t osc = (uint64_t)CONFIG_RC_PCA9685_OSC_HZ;
+	uint64_t denom = (uint64_t)PCA9685_PWM_STEPS * hz;
+	uint32_t prescale;
+	uint8_t reg = PCA9685_REG_PRE_SCALE;
+	uint8_t rb = 0;
+	uint32_t expect_hz;
+	int err;
+
+	if (hz == 0U || denom == 0U) {
+		return -EINVAL;
+	}
+
+	/* prescale = round(osc / (4096 * hz)) - 1 */
+	prescale = (uint32_t)((osc + denom / 2ULL) / denom);
+	if (prescale < (PCA9685_PRESCALE_MIN + 1U)) {
+		return -EINVAL;
+	}
+	prescale -= 1U;
+	if (prescale > PCA9685_PRESCALE_MAX) {
+		return -EINVAL;
+	}
+
+	pca_prescale = (uint8_t)prescale;
+	pca_period_count = PCA9685_PWM_STEPS * (prescale + 1U);
+
+	err = pwm_set_cycles(pca9685_dev, 0, pca_period_count, 0, 0);
+	if (err != 0) {
+		LOG_ERR("PCA9685 rate set failed: %d", err);
+		return err;
+	}
+
+	err = i2c_write_read_dt(&pca9685_i2c, &reg, 1, &rb, 1);
+	if (err != 0) {
+		LOG_WRN("PCA9685 PRE_SCALE readback failed: %d", err);
+	} else if (rb != pca_prescale) {
+		LOG_WRN("PCA9685 PRE_SCALE=0x%02x (wrote 0x%02x)", rb, pca_prescale);
+	}
+
+	expect_hz = (uint32_t)(osc / ((uint64_t)PCA9685_PWM_STEPS * (pca_prescale + 1U)));
+	LOG_INF("PCA9685 PRE_SCALE=%u osc=%u Hz → expect ~%u Hz (target %u)",
+		pca_prescale, CONFIG_RC_PCA9685_OSC_HZ, expect_hz, hz);
+	return 0;
+}
+
 int rc_prx_pwm_init(void)
 {
 	int err;
@@ -239,12 +305,17 @@ int rc_prx_pwm_init(void)
 		}
 	}
 
+	err = pca9685_configure_rate(RC_PWM_HZ);
+	if (err != 0) {
+		return err;
+	}
+
 	k_work_init_delayable(&failsafe_work, failsafe_work_handler);
 	k_work_init(&pwm_apply_work, pwm_apply_work_handler);
 	pwm_ready = true;
 	apply_failsafe();
-	LOG_INF("RC PWM ready: PCA9685@0x%02x %u ch @ 50 Hz (OE=P2.10, CH4=RT)",
-		pca9685_i2c.addr, RC_PRX_PWM_CHANNEL_COUNT);
+	LOG_INF("RC PWM ready: PCA9685@0x%02x %u ch @ %u Hz (OE=P2.10, CH4=RT)",
+		pca9685_i2c.addr, RC_PRX_PWM_CHANNEL_COUNT, RC_PWM_HZ);
 	return 0;
 }
 

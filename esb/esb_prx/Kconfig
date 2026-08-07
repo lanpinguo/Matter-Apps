@@ -12,4 +12,15 @@ config ESB_PRX_APP_LOG_LEVEL
 	int "Log level for the ESB PRX sample"
 	default 4
 
+config RC_PCA9685_OSC_HZ
+	int "PCA9685 internal oscillator frequency (Hz)"
+	default 27700000
+	help
+	  Datasheet nominal is 25 MHz, but the internal OSC is inaccurate.
+	  With the Zephyr driver assuming 25 MHz and a 20 ms period
+	  (PRE_SCALE≈122), this board measured ~55 Hz on the scope.
+	  Default 27.7 MHz is calibrated so update rate ≈ 50 Hz
+	  (55/50 × 25 MHz). Re-measure and adjust if needed:
+	  OSC ≈ f_meas × 4096 × (PRE_SCALE + 1).
+
 endmenu
