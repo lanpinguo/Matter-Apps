@@ -12,13 +12,8 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/random/random.h>
-#include <zephyr/settings/settings.h>
 #include <zephyr/sys/byteorder.h>
 #include <zephyr/sys/util.h>
-
-#include "rc_link.h"
-
-LOG_MODULE_REGISTER(rc_esb_radio, CONFIG_LOG_DEFAULT_LEVEL);
 
 #ifndef ESB_RADIO_SUBTREE
 #error "Define ESB_RADIO_SUBTREE to esb_ptx or esb_prx"
@@ -27,6 +22,18 @@ LOG_MODULE_REGISTER(rc_esb_radio, CONFIG_LOG_DEFAULT_LEVEL);
 #ifndef ESB_RADIO_MODE
 #error "Define ESB_RADIO_MODE to ESB_MODE_PTX or ESB_MODE_PRX"
 #endif
+
+#ifndef RC_ESB_RADIO_PERSIST
+#define RC_ESB_RADIO_PERSIST 1
+#endif
+
+#if RC_ESB_RADIO_PERSIST
+#include <zephyr/settings/settings.h>
+#endif
+
+#include "rc_link.h"
+
+LOG_MODULE_REGISTER(rc_esb_radio, CONFIG_LOG_DEFAULT_LEVEL);
 
 #define RC_ESB_SETTINGS_KEY ESB_RADIO_SUBTREE "/radio"
 #define RC_ESB_STORE_VERSION 1U
@@ -124,6 +131,7 @@ static int rc_esb_radio_hw_apply(const struct uart_rc_esb_config *cfg)
 	return err;
 }
 
+#if RC_ESB_RADIO_PERSIST
 static int rc_esb_radio_store_save(void)
 {
 	struct rc_esb_store store = {
@@ -169,6 +177,7 @@ static int rc_esb_radio_settings_set(const char *name, size_t len,
 
 SETTINGS_STATIC_HANDLER_DEFINE(rc_esb_radio, ESB_RADIO_SUBTREE, NULL,
 			       rc_esb_radio_settings_set, NULL, NULL);
+#endif /* RC_ESB_RADIO_PERSIST */
 
 void rc_esb_radio_set_applied_cb(rc_esb_radio_applied_cb_t cb)
 {
@@ -182,7 +191,11 @@ bool rc_esb_radio_has_saved_config(void)
 
 int rc_esb_radio_load_settings(void)
 {
+#if RC_ESB_RADIO_PERSIST
 	return settings_load_subtree(ESB_RADIO_SUBTREE);
+#else
+	return 0;
+#endif
 }
 
 int rc_esb_radio_get_config(struct uart_rc_esb_config *cfg)
@@ -370,6 +383,7 @@ bool rc_esb_radio_pair_broadcast_active(void)
 
 int rc_esb_radio_clear_saved_config(void)
 {
+#if RC_ESB_RADIO_PERSIST
 	int err;
 
 	/* Delete persisted settings and reset to defaults (pair-listen mode). */
@@ -377,6 +391,7 @@ int rc_esb_radio_clear_saved_config(void)
 	if (err != 0 && err != -ENOENT) {
 		return err;
 	}
+#endif
 
 	staged_valid = false;
 	has_saved_config = false;
@@ -399,6 +414,7 @@ int rc_esb_radio_apply(void)
 
 int rc_esb_radio_save(void)
 {
+#if RC_ESB_RADIO_PERSIST
 	int err = rc_esb_radio_store_save();
 
 	if (err == 0) {
@@ -406,6 +422,11 @@ int rc_esb_radio_save(void)
 	}
 
 	return err;
+#else
+	/* Hub (xbox_central) owns persistence; PTX SAVE is a no-op success. */
+	has_saved_config = staged_valid;
+	return 0;
+#endif
 }
 
 int rc_esb_radio_init(rc_esb_event_handler_t handler)
@@ -417,6 +438,7 @@ int rc_esb_radio_init(rc_esb_event_handler_t handler)
 	has_saved_config = false;
 	esb_has_been_initialized = false;
 
+#if RC_ESB_RADIO_PERSIST
 	err = settings_subsys_init();
 	if (err != 0) {
 		LOG_WRN("Settings subsys init failed: %d", err);
@@ -434,8 +456,17 @@ int rc_esb_radio_init(rc_esb_event_handler_t handler)
 	} else {
 		LOG_WRN("Saved radio config loaded (subtree %s)", ESB_RADIO_SUBTREE);
 	}
+#else
+	rc_esb_radio_defaults(&staged_cfg);
+	staged_valid = true;
+	LOG_WRN("Radio persist off — defaults until Hub SET_ADDR/APPLY or PAIR");
+#endif
 
-	return rc_esb_radio_apply();
+	err = rc_esb_radio_apply();
+	if (err != 0) {
+		LOG_WRN("Radio apply failed: %d", err);
+	}
+	return err;
 }
 
 int rc_esb_radio_handle_req(const struct uart_rc_esb_req *req,
@@ -480,9 +511,11 @@ int rc_esb_radio_handle_req(const struct uart_rc_esb_req *req,
 		if (err == 0) {
 			err = rc_esb_radio_apply();
 		}
+#if RC_ESB_RADIO_PERSIST
 		if (err == 0) {
 			err = rc_esb_radio_save();
 		}
+#endif
 		if (err == 0) {
 			rsp->data_len = (uint8_t)sizeof(cfg);
 			memcpy(rsp->data, &cfg, sizeof(cfg));

@@ -12,9 +12,9 @@
 enum hub_status_led_mode {
 	/** LED off. */
 	HUB_STATUS_LED_OFF = 0,
-	/** Slow blink: firmware running, idle / scanning. */
+	/** 1 Hz blink: link lost / idle / scanning. */
 	HUB_STATUS_LED_IDLE,
-	/** Faster blink: Xbox (or primary link) connected. */
+	/** Solid on: Xbox (or primary link) connected and stable. */
 	HUB_STATUS_LED_ACTIVE,
 	/** Rapid blink: ESB OTA pairing in progress. */
 	HUB_STATUS_LED_PAIRING,
@@ -23,14 +23,14 @@ enum hub_status_led_mode {
 };
 
 /**
- * Configure GPIO from DT alias status-led and start idle heartbeat.
+ * Configure GPIO from DT alias status-led and start 1 Hz idle blink.
  * Safe to call when alias is missing (returns -ENOENT, no-op).
  */
 int hub_status_led_init(void);
 
 void hub_status_led_set_mode(enum hub_status_led_mode mode);
 
-/** Convenience: ACTIVE when @p connected, else IDLE (keeps FAULT/PAIRING if set). */
+/** Convenience: solid on when @p connected, else 1 Hz idle (keeps FAULT/PAIRING). */
 void hub_status_led_set_xbox_connected(bool connected);
 
 /** Rapid blink while ESB OTA pair session is active; restores idle/active when done. */

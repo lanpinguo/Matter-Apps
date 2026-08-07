@@ -14,6 +14,7 @@ target_sources(app PRIVATE
   src/xbox_hids.c
   src/bq25895.c
   src/bq_shell.c
+  src/esb_shell.c
   src/hub_log.c
   src/hub_flash_log.c
   src/hub_ble_log.c

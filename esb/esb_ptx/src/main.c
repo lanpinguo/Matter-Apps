@@ -29,6 +29,7 @@
 #include "rc_channel_bank.h"
 #include "rc_esb_radio.h"
 #include "rc_link.h"
+#include "rc_ptx_status_led.h"
 #include "rc_ptx_uart_channels.h"
 #include "rc_uart_bridge.h"
 
@@ -47,6 +48,7 @@ static struct rc_link_frame ctrl_frame;
 static int64_t next_pair_tx_ms;
 static bool pending_pair_restore;
 static bool pair_probe_pending;
+static bool pair_led_latched;
 static struct uart_rc_esb_config saved_paired_cfg;
 
 static void pair_complete(const char *reason)
@@ -55,6 +57,10 @@ static void pair_complete(const char *reason)
 	pair_probe_pending = false;
 	(void)rc_esb_radio_apply_cfg(&saved_paired_cfg);
 	rc_esb_radio_end_pair_broadcast();
+	if (pair_led_latched) {
+		pair_led_latched = false;
+		rc_ptx_status_led_set_pairing(false);
+	}
 	LOG_WRN("%s — enter UART CTRL forward", reason);
 }
 
@@ -66,17 +72,6 @@ static void restore_paired_radio_cfg(void)
 
 	(void)rc_esb_radio_apply_cfg(&saved_paired_cfg);
 	pending_pair_restore = false;
-}
-
-static void leds_update(uint8_t value)
-{
-	uint32_t leds_mask =
-		(!(value % 8 > 0 && value % 8 <= 4) ? DK_LED1_MSK : 0) |
-		(!(value % 8 > 1 && value % 8 <= 5) ? DK_LED2_MSK : 0) |
-		(!(value % 8 > 2 && value % 8 <= 6) ? DK_LED3_MSK : 0) |
-		(!(value % 8 > 3) ? DK_LED4_MSK : 0);
-
-	dk_set_leds(leds_mask);
 }
 
 static void handle_status_frame(const struct esb_payload *payload)
@@ -130,6 +125,8 @@ void event_handler(struct esb_evt const *event)
 			}
 		} else {
 			restore_paired_radio_cfg();
+			/* PRX ACKed CTRL — RF link alive. */
+			rc_ptx_status_led_on_link();
 			LOG_DBG("Control frame sent");
 		}
 		break;
@@ -301,7 +298,7 @@ int main(void)
 {
 	int err;
 
-	LOG_WRN("ESB PTX ready (UART RC forward; Hub Btn1/P1.02 PAIR until PRX ACK)");
+	LOG_WRN("ESB PTX ready (UART RC; Hub owns pair store; Btn1 PAIR until PRX ACK)");
 
 	err = clocks_start();
 	if (err) {
@@ -314,17 +311,18 @@ int main(void)
 		return 0;
 	}
 
+	err = rc_ptx_status_led_init();
+	if (err) {
+		LOG_WRN("status LED init failed: %d", err);
+	}
+
 	err = esb_initialize();
 	if (err) {
 		LOG_ERR("ESB initialization failed, err %d", err);
 		return 0;
 	}
 
-	if (rc_esb_radio_has_saved_config()) {
-		LOG_WRN("Paired addresses restored from flash — ready for CTRL");
-	} else {
-		LOG_WRN("No saved pair — hold Hub Btn1 to OTA PAIR with PRX");
-	}
+	LOG_WRN("No local pair store — wait Hub SET_ADDR/APPLY (boot) or Btn1 PAIR");
 
 	err = rc_uart_bridge_init();
 	if (err) {
@@ -341,6 +339,14 @@ int main(void)
 
 			struct uart_rc_esb_config paired_cfg;
 			const bool pair_window = rc_esb_radio_pair_broadcast_active();
+
+			if (pair_window && !pair_led_latched) {
+				pair_led_latched = true;
+				rc_ptx_status_led_set_pairing(true);
+			} else if (!pair_window && pair_led_latched) {
+				pair_led_latched = false;
+				rc_ptx_status_led_set_pairing(false);
+			}
 
 			if (pair_window && pair_probe_pending) {
 				/*
@@ -395,10 +401,6 @@ int main(void)
 					LOG_ERR("Prepare control frame failed: %d", err);
 					ready = true;
 					continue;
-				}
-
-				if (ctrl_frame.channel_count > 1U) {
-					leds_update((uint8_t)ctrl_frame.channels[1]);
 				}
 
 				err = pack_ctrl_payload(&tx_payload);

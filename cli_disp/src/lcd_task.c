@@ -14,8 +14,57 @@
 #include <string.h>
 
 #include "lcd_task.h"
+#include "adc_task.h"
 
 LOG_MODULE_REGISTER(lcd_task, LOG_LEVEL_DBG);
+
+/* 5x7 字体：每字符 5 列 x 7 行，5 字节/字符(列主序，每字节 bit0=上)。仅含 0-9 空格 C h : m V . - */
+#define FONT_W  5
+#define FONT_H  7
+static const uint8_t font_5x7[][5] = {
+	{ 0x00, 0x00, 0x00, 0x00, 0x00 }, /* space */
+	{ 0x7B, 0x45, 0x45, 0x45, 0x7B }, /* 0 */
+	{ 0x00, 0x42, 0x7F, 0x40, 0x00 }, /* 1 */
+	{ 0x62, 0x51, 0x49, 0x49, 0x46 }, /* 2 */
+	{ 0x22, 0x49, 0x49, 0x49, 0x36 }, /* 3 */
+	{ 0x18, 0x14, 0x12, 0x7F, 0x10 }, /* 4 */
+	{ 0x27, 0x45, 0x45, 0x45, 0x39 }, /* 5 */
+	{ 0x3E, 0x49, 0x49, 0x49, 0x32 }, /* 6 */
+	{ 0x01, 0x71, 0x09, 0x05, 0x03 }, /* 7 */
+	{ 0x36, 0x49, 0x49, 0x49, 0x36 }, /* 8 */
+	{ 0x26, 0x49, 0x49, 0x49, 0x3E }, /* 9 */
+	{ 0x3E, 0x41, 0x41, 0x41, 0x22 }, /* C */
+	{ 0x7F, 0x08, 0x04, 0x04, 0x78 }, /* h */
+	{ 0x00, 0x36, 0x36, 0x00, 0x00 }, /* : */
+	{ 0x7C, 0x04, 0x78, 0x04, 0x78 }, /* m */
+	{ 0x1C, 0x20, 0x40, 0x20, 0x1C }, /* V */
+	{ 0x00, 0x60, 0x60, 0x00, 0x00 }, /* . */
+	{ 0x08, 0x08, 0x08, 0x08, 0x08 }, /* - */
+};
+#define FONT_INDEX_SPACE 0
+#define FONT_INDEX_0     1
+#define FONT_INDEX_9     10
+#define FONT_INDEX_C    11
+#define FONT_INDEX_h    12
+#define FONT_INDEX_COL  13
+#define FONT_INDEX_m    14
+#define FONT_INDEX_V    15
+#define FONT_INDEX_DOT  16
+#define FONT_INDEX_MINUS 17
+
+static uint8_t char_to_font_index(char c)
+{
+	if (c == ' ') return FONT_INDEX_SPACE;
+	if (c >= '0' && c <= '9') return FONT_INDEX_0 + (c - '0');
+	if (c == 'C') return FONT_INDEX_C;
+	if (c == 'h') return FONT_INDEX_h;
+	if (c == ':') return FONT_INDEX_COL;
+	if (c == 'm') return FONT_INDEX_m;
+	if (c == 'V') return FONT_INDEX_V;
+	if (c == '.') return FONT_INDEX_DOT;
+	if (c == '-') return FONT_INDEX_MINUS;
+	return FONT_INDEX_SPACE;
+}
 
 /* LCD尺寸定义 (逻辑宽高，与 MADCTL 方向一致) */
 #define LCD_WIDTH  160
@@ -248,6 +297,85 @@ static void lcd_clear(uint16_t color)
 	lcd_fill_rect(0, 0, LCD_WIDTH, LCD_HEIGHT, color);
 }
 
+/* 画单字符 5x7，左上角 (x,y)，fg/bg 为 RGB565。
+ * MADCTL 0xC8：MX=1 使逻辑列小的一侧显示在右，故对“绘制列位置”做镜像；MY=1 用反序送行补偿。 */
+static void lcd_draw_char(uint8_t x, uint8_t y, char c, uint16_t fg, uint16_t bg)
+{
+	uint8_t idx = char_to_font_index(c);
+	static uint8_t col_buf[FONT_H * 2];
+
+	for (uint8_t col = 0; col < FONT_W; col++) {
+		uint8_t bits = font_5x7[idx][col];  /* 字模列按正常顺序读 */
+		/* 左右镜像：MX=1 时小 x 显示在右，故字模左列(col=0)画到 x+4，右列(col=4)画到 x+0 */
+		uint8_t draw_col = col;
+		/* 上下镜像：MY=1 时先送像素显示在下，送像素顺序为 row 6..0 */
+		for (uint8_t i = 0; i < FONT_H; i++) {
+			uint8_t row = FONT_H - 1 - i;
+			uint16_t color = (bits & (1U << row)) ? fg : bg;
+			col_buf[i * 2] = (color >> 8) & 0xFF;
+			col_buf[i * 2 + 1] = color & 0xFF;
+		}
+		lcd_set_window(x + draw_col, y, x + draw_col, y + FONT_H - 1);
+		lcd_write_data_buf(col_buf, sizeof(col_buf));
+	}
+}
+
+/* 画字符串，左上角 (x,y)，fg/bg RGB565，字符间距 1 像素 */
+static void lcd_draw_string(uint8_t x, uint8_t y, const char *str, uint16_t fg, uint16_t bg)
+{
+	while (*str && x + FONT_W <= LCD_WIDTH) {
+		lcd_draw_char(x, y, *str++, fg, bg);
+		x += FONT_W + 1;
+	}
+}
+
+/* ADC 显示区域：物理顶部 22 像素，两行文字。MADCTL MY=1 时逻辑 y 小在屏下方，故用偏移使区域在屏顶 */
+#define ADC_DISPLAY_HEIGHT  22
+#define ADC_LINE0_Y         2
+#define ADC_LINE1_Y         12
+#define ADC_DISPLAY_Y_OFFSET  (LCD_HEIGHT - ADC_DISPLAY_HEIGHT)  /* 58：区域放在逻辑顶部=物理底部之上 */
+
+/* 将当前 ADC 采样值显示到 LCD 物理顶部 */
+void lcd_show_adc(void)
+{
+	int16_t raw[ADC_TASK_CHANNEL_COUNT];
+	int32_t mv[ADC_TASK_CHANNEL_COUNT];
+	bool valid[ADC_TASK_CHANNEL_COUNT];
+	char buf[20];
+	static const uint8_t channel_ids[] = { 4, 5 }; /* 与 overlay io-channels 一致 */
+
+	if (!lcd_initialized) {
+		return;
+	}
+
+	adc_task_get_values(raw, mv, valid, ADC_TASK_CHANNEL_COUNT);
+
+	/* 清空显示区域（在物理顶部，即逻辑 y 大的一端） */
+	lcd_fill_rect(0, ADC_DISPLAY_Y_OFFSET, LCD_WIDTH, ADC_DISPLAY_HEIGHT, COLOR_BLACK);
+
+	for (size_t i = 0; i < ADC_TASK_CHANNEL_COUNT; i++) {
+		uint8_t line_y = (i == 0) ? ADC_LINE0_Y : ADC_LINE1_Y;
+		uint8_t y = ADC_DISPLAY_Y_OFFSET + line_y;
+		if (valid[i]) {
+			snprintf(buf, sizeof(buf), "Ch%u: %d mV", (unsigned)channel_ids[i], (int)mv[i]);
+		} else {
+			snprintf(buf, sizeof(buf), "Ch%u: -- mV", (unsigned)channel_ids[i]);
+		}
+		lcd_draw_string(2, y, buf, COLOR_WHITE, COLOR_BLACK);
+	}
+}
+
+static void adc_display_work_handler(struct k_work *work);
+static K_WORK_DELAYABLE_DEFINE(adc_display_work, adc_display_work_handler);
+
+static void adc_display_work_handler(struct k_work *work)
+{
+	if (lcd_initialized) {
+		lcd_show_adc();
+	}
+	k_work_schedule(&adc_display_work, K_MSEC(1000));
+}
+
 /* ST7735S初始化序列 */
 static void lcd_init_sequence(void)
 {
@@ -322,7 +450,7 @@ static void lcd_init_sequence(void)
 
 	/* 内存访问控制 */
 	lcd_write_cmd(ST7735_MADCTL);
-	lcd_write_data(0xC8);
+	lcd_write_data(0x08);
 
 	/* 列/行地址：160x80 时控制器为 80 列 x 160 行(MV=1)，加偏移使可见区居中 */
 	lcd_write_cmd(ST7735_CASET);
@@ -563,6 +691,9 @@ void lcd_task_enable(void)
 		LOG_ERR("Failed to initialize LCD: %d", ret);
 		return;
 	}
+
+	/* 启动 ADC 值定时刷新到 LCD（每 1s） */
+	k_work_schedule(&adc_display_work, K_MSEC(500));
 
 	LOG_INF("LCD task enabled");
 }

@@ -1,7 +1,11 @@
 /*
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  *
- * Heartbeat / status indication on DT alias status-led (P2.07).
+ * Status LED on DT alias status-led (P2.07):
+ *   idle / lost  — 1 Hz blink
+ *   connected    — solid on
+ *   pairing      — rapid blink
+ *   fault        — solid on
  */
 
 #include "hub_status_led.h"
@@ -25,10 +29,9 @@ static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(STATUS_LED_NODE, 
 #define STATUS_LED_AVAILABLE 0
 #endif
 
-#define IDLE_PERIOD_MS     1000U /* 500 ms on / 500 ms off */
-#define ACTIVE_PERIOD_MS    400U /* 200 ms on / 200 ms off */
+/* Full blink period: 500 ms on / 500 ms off → 1 Hz when link lost / idle. */
+#define IDLE_PERIOD_MS     1000U
 #define PAIRING_PERIOD_MS   160U /* 80 ms on / 80 ms off — distinct rapid blink */
-#define FAULT_PERIOD_MS       0U /* solid */
 
 static enum hub_status_led_mode mode = HUB_STATUS_LED_OFF;
 static bool led_on;
@@ -42,12 +45,12 @@ static uint32_t period_for_mode(enum hub_status_led_mode m)
 	switch (m) {
 	case HUB_STATUS_LED_PAIRING:
 		return PAIRING_PERIOD_MS;
-	case HUB_STATUS_LED_ACTIVE:
-		return ACTIVE_PERIOD_MS;
-	case HUB_STATUS_LED_FAULT:
-		return FAULT_PERIOD_MS;
 	case HUB_STATUS_LED_IDLE:
 		return IDLE_PERIOD_MS;
+	case HUB_STATUS_LED_ACTIVE:
+	case HUB_STATUS_LED_FAULT:
+		/* Solid on. */
+		return 0U;
 	case HUB_STATUS_LED_OFF:
 	default:
 		return 0U;
@@ -72,7 +75,7 @@ static void blink_work_handler(struct k_work *work)
 
 	period = period_for_mode(mode);
 	if (period == 0U) {
-		/* OFF or FAULT: solid state already applied. */
+		/* OFF / ACTIVE / FAULT: solid state already applied. */
 		return;
 	}
 
@@ -92,7 +95,8 @@ static void apply_mode(enum hub_status_led_mode next)
 		led_apply(false);
 		return;
 	}
-	if (mode == HUB_STATUS_LED_FAULT || period == 0U) {
+	if (period == 0U) {
+		/* ACTIVE / FAULT: solid on. */
 		led_apply(true);
 		return;
 	}
@@ -125,7 +129,7 @@ int hub_status_led_init(void)
 	fault_latched = false;
 	pairing_active = false;
 	apply_mode(HUB_STATUS_LED_IDLE);
-	HUB_INF("status LED on P2.07 — idle heartbeat\n");
+	HUB_INF("status LED on P2.07 — lost 1 Hz / connected solid\n");
 	return 0;
 #endif
 }

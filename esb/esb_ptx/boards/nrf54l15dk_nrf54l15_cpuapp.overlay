@@ -3,7 +3,11 @@
  *
  * Console / Hub RC link on uart20: TX/RX only (no hardware flow control).
  * Match Ground BLE Hub uart30 speed for the wired RC link.
+ *
+ * Status LED on P2.07 (DK LED3 / led2): lost 1 Hz, PRX link solid, pair rapid.
  */
+
+#include <zephyr/dt-bindings/gpio/gpio.h>
 
 &pinctrl {
 	uart20_default: uart20_default {
@@ -31,4 +35,18 @@
 	pinctrl-0 = <&uart20_default>;
 	pinctrl-1 = <&uart20_sleep>;
 	pinctrl-names = "default", "sleep";
+};
+
+/*
+ * Override DK LED3 (DT: led2, P2.07): external status LED is active-low.
+ */
+&led2 {
+	gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+	label = "LED3 / Status LED (P2.07, active-low)";
+};
+
+/ {
+	aliases {
+		status-led = &led2;
+	};
 };

@@ -9,7 +9,7 @@ Features
 * ESB PRX mode at 2 Mbps, receives control frames from PTX
 * Sends aircraft status back to PTX inside ACK payloads
 * Nine RC PWM outputs via **PCA9685** (50 Hz, 1000–2000 µs); CH4 is throttle from Xbox RT
-* Status LED on **P2.07**: CTRL/keepalive 0.5 Hz, channel-change flash once, lost/boot off, pair rapid
+* Status LED on **P2.07**: lost **1 Hz**, idle/keepalive **solid**, channel-change flash once, pair rapid
 * UART RC link on the **console UART** for ESB pair/config/save (bench setup)
 * Radio addresses persisted in flash (``esb_prx/radio`` settings key)
 * If no saved config exists, PRX enters auto-pair mode and accepts the first valid ESB ``PAIR`` frame
@@ -49,15 +49,17 @@ PTX and PRX must use the **same ESB addresses**. Preferred path is **OTA**:
 
 1. Put PRX in pair mode (no saved ``esb_prx/radio``, or hold PRX **Btn1 (P1.02)** for 5 s).
 2. Wire Hub ``uart30`` to PTX console UART, hold Hub **Btn1 (P1.02)** for 1.5 s.
-3. PTX generates addresses, saves them, and broadcasts ESB ``PAIR`` on the
-   default listen address until PRX ACKs (max 30 s). PRX accepts the first
-   valid frame, saves, and PTX switches to UART CTRL forward immediately.
+3. PTX generates addresses (RAM only), broadcasts ESB ``PAIR`` on the default
+   listen address until PRX ACKs (max 30 s). PRX accepts the first valid frame
+   and saves locally; Hub saves the same config to ``xbox_hub/esb_radio``.
 4. Remove the bench UART wire if desired; airborne link uses ESB only.
+5. After Hub/PTX reboot, Hub restores PTX via ``SET_RADIO``/``SET_ADDR``/``APPLY``.
 
-Alternate bench path (UART sync to PRX):
+Alternate bench path (UART apply to device on Hub UART):
 
-1. Press Hub **Btn1 (P1.02)** while wired to PTX (caches addresses on Hub).
-2. Rewire Hub UART to PRX, press Hub **button 3** to ``SET_ADDR`` / ``APPLY`` / ``SAVE``.
+1. Complete an OTA pair once so Hub has ``xbox_hub/esb_radio``.
+2. Press Hub **button 3** to re-push ``SET_RADIO`` / ``SET_ADDR`` / ``APPLY``
+   (no PTX SAVE — Hub owns persistence).
 
 Radio clear (long press)
 -------------------------

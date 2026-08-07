@@ -7,7 +7,9 @@ Features
 --------
 
 * ESB PTX mode at 2 Mbps; forwards Hub UART CTRL frames over ESB
-* On Hub ``PAIR`` (Btn1 / P1.02): generate addresses, SAVE, broadcast OTA ``PAIR`` until PRX ACK (max 30 s)
+* Status LED on **P2.07**: lost **1 Hz** blink, PRX link **solid**, OTA pair rapid blink
+* On Hub ``PAIR`` (Btn1 / P1.02): generate addresses (RAM only), broadcast OTA ``PAIR`` until PRX ACK (max 30 s)
+* **No local pair flash** — Hub (:file:`xbox_central`) owns persistence and restores via UART at boot
 * Receives aircraft status in ACK payloads (bidirectional link)
 * UART RC link on the **console UART** (uart20), multiplexed with printk logs
 * Pair with :file:`apps/esb/esb_prx` for end-to-end testing
@@ -36,14 +38,14 @@ Protocol definition: :file:`apps/esb/common/uart_rc_link.h`
 
 Message types beyond stick channels:
 
-* ``TYPE_ESB_REQ/RSP (0x03/0x04)`` — radio config, pair, apply, save
+* ``TYPE_ESB_REQ/RSP (0x03/0x04)`` — radio config, pair, apply (SAVE is a no-op on PTX)
 * ``TYPE_DEBUG_CTRL/LOG (0x05/0x06)`` — enable log forwarding and stream text to Hub
 
 Hub DK buttons (when wired to ESB PTX console UART):
 
-* **Btn1 (P1.02)** hold 1.5 s — ``PAIR`` PTX: generate addresses, SAVE, broadcast OTA
-  ``PAIR`` until PRX ACK (max 30 s; PRX must be in pair mode)
-* Button 3 short press — optional UART sync of the same addresses to PRX (rewire Hub UART)
+* **Btn1 (P1.02)** hold 1.5 s — ``PAIR`` PTX: generate addresses, broadcast OTA
+  ``PAIR`` until PRX ACK (max 30 s; PRX must be in pair mode); Hub saves on success
+* Button 3 short press — re-push Hub-saved config to PTX (``SET_RADIO``/``SET_ADDR``/``APPLY``)
 * Button 3 hold 1.5 s — toggle ESB debug log forwarding
 
 OTA pairing
@@ -53,6 +55,7 @@ OTA pairing
 2. Keep Hub UART wired to PTX; hold Hub **Btn1 (P1.02)** for 1.5 s.
 3. Within the window PRX should ACK the PAIR frame; PTX then immediately enters
    UART CTRL forward mode on the new addresses (falls back to 30 s timeout).
+4. Hub persists the pair config; on later power-up Hub pushes it to PTX automatically.
 
 Build
 -----
@@ -66,4 +69,4 @@ Build
 Flash this image to the transmitter DK and :file:`apps/esb/esb_prx` to a second DK.
 ESB control frames are sent only while UART CTRL frames arrive from the Hub
 (500 ms link timeout). No onboard demo channels are transmitted.
-LED patterns on both boards should stay in sync.
+Status LED (P2.07): **1 Hz** when PRX not ACKing, **solid** while CTRL link is up.

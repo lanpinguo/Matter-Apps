@@ -33,6 +33,7 @@
 #include "uart_rc_link.h"
 #include "bq25895.h"
 #include "hub_ble_log.h"
+#include "hub_esb.h"
 #include "hub_flash_log.h"
 #include "hub_status_led.h"
 
@@ -47,6 +48,8 @@
 #define CONFIG_PARAM_TELEMETRY_MS      1
 #define SETTINGS_KEY_TELEMETRY_MS      "xbox_hub/telemetry_ms"
 #define SETTINGS_KEY_XBOX_ADDR         "xbox_hub/xbox_addr"
+#define SETTINGS_KEY_ESB_RADIO         "xbox_hub/esb_radio"
+#define HUB_ESB_STORE_VERSION          1U
 
 /* Fast LE interval after connect (7.5–11.25 ms). */
 #define XBOX_CONN_INTERVAL_MIN           6U
@@ -64,6 +67,9 @@
 #define KEY_ESB_PTX_PAIR               DK_BTN1_MSK
 #define ESB_BTN_HOLD_MS                1500
 #define ESB_PAIR_WATCHDOG_MS           32000
+#define ESB_BOOT_RESTORE_DELAY_MS      500
+#define ESB_QUERY_TIMEOUT_MS           800
+#define ESB_PING_TIMEOUT_MS            300
 
 static const char *uart_esb_cmd_name(uint8_t cmd)
 {
@@ -184,6 +190,25 @@ static uint8_t uart_debug_ctrl_seq;
 static bool uart_debug_forward_enabled;
 static struct uart_rc_esb_config uart_paired_cfg;
 static bool uart_paired_cfg_valid;
+/* Last successfully paired config persisted on Hub (restored after failed PAIR). */
+static struct uart_rc_esb_config uart_esb_cfg_saved;
+static bool uart_esb_cfg_saved_valid;
+
+struct hub_esb_store {
+	uint16_t version;
+	struct uart_rc_esb_config cfg;
+} __packed;
+
+static struct uart_rc_link_status esb_last_status;
+static bool esb_last_status_valid;
+static int64_t esb_last_status_uptime_ms;
+static K_SEM_DEFINE(esb_rsp_sem, 0, 1);
+static struct uart_rc_esb_rsp esb_last_rsp;
+static bool esb_last_rsp_valid;
+static uint8_t esb_wait_rsp_cmd; /* 0 = not waiting */
+static int64_t esb_last_ptx_rsp_uptime_ms;
+static bool esb_last_ptx_rsp_seen;
+
 static bool esb_ptx_hold_armed;
 static bool esb_ptx_hold_fired;
 static bool esb_debug_hold_armed;
@@ -192,6 +217,7 @@ static bool esb_pair_session_active;
 static struct k_work_delayable esb_ptx_hold_work;
 static struct k_work_delayable esb_debug_hold_work;
 static struct k_work_delayable esb_pair_watchdog_work;
+static struct k_work_delayable esb_boot_restore_work;
 static struct k_work_delayable uart_ctrl_heartbeat_work;
 static bt_addr_le_t bonded_xbox_addr;
 static bool bonded_xbox_valid;
@@ -544,6 +570,9 @@ static void on_uart_status(const struct uart_rc_link_status *status, void *user_
 	telemetry_data.pitch = status->pitch;
 	telemetry_data.yaw = status->yaw;
 	telemetry_data.flags |= BIT(1);
+	esb_last_status = *status;
+	esb_last_status_valid = true;
+	esb_last_status_uptime_ms = k_uptime_get();
 	k_mutex_unlock(&data_mutex);
 
 	if (esb_pair_session_active) {
@@ -553,11 +582,56 @@ static void on_uart_status(const struct uart_rc_link_status *status, void *user_
 	}
 }
 
-static void esb_pair_session_end(void)
+static int hub_esb_cfg_persist(const struct uart_rc_esb_config *cfg)
+{
+	struct hub_esb_store store = {
+		.version = HUB_ESB_STORE_VERSION,
+	};
+	int err;
+
+	if (cfg == NULL) {
+		return -EINVAL;
+	}
+
+	store.cfg = *cfg;
+	err = settings_save_one(SETTINGS_KEY_ESB_RADIO, &store, sizeof(store));
+	if (err != 0) {
+		return err;
+	}
+
+	uart_esb_cfg_saved = *cfg;
+	uart_esb_cfg_saved_valid = true;
+	uart_paired_cfg = *cfg;
+	uart_paired_cfg_valid = true;
+	return 0;
+}
+
+static void esb_pair_session_end(bool success)
 {
 	esb_pair_session_active = false;
 	(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
 	hub_status_led_set_pairing(false);
+
+	if (success) {
+		if (uart_paired_cfg_valid) {
+			int err = hub_esb_cfg_persist(&uart_paired_cfg);
+
+			if (err == 0) {
+				HUB_INF_M(HUB_MOD_ESB, "[PAIR] saved ESB config on Hub flash\n");
+			} else {
+				HUB_ERR_M(HUB_MOD_ESB, "[PAIR] Hub save failed: %d\n", err);
+			}
+		}
+		return;
+	}
+
+	/* Failed attempt — keep previous Hub flash config in RAM if any. */
+	if (uart_esb_cfg_saved_valid) {
+		uart_paired_cfg = uart_esb_cfg_saved;
+		uart_paired_cfg_valid = true;
+	} else {
+		uart_paired_cfg_valid = false;
+	}
 }
 
 static void esb_pair_watchdog_handler(struct k_work *work)
@@ -568,7 +642,7 @@ static void esb_pair_watchdog_handler(struct k_work *work)
 		return;
 	}
 
-	esb_pair_session_end();
+	esb_pair_session_end(false);
 	HUB_ERR_M(HUB_MOD_ESB, "[PAIR] watchdog: no PTX pair-done within %d ms\n", ESB_PAIR_WATCHDOG_MS);
 	HUB_DBG_M(HUB_MOD_ESB, "[PAIR] check: PRX in pair mode? PTX UART logs above? ESB RF link?\n");
 }
@@ -582,10 +656,19 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 	HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP seq=%u cmd=%s(0x%02x) status=%d data_len=%u\n",
 	       rsp->seq, uart_esb_cmd_name(rsp->cmd), rsp->cmd, rsp->status, rsp->data_len);
 
+	esb_last_rsp = *rsp;
+	esb_last_rsp_valid = true;
+	esb_last_ptx_rsp_seen = true;
+	esb_last_ptx_rsp_uptime_ms = k_uptime_get();
+	if (esb_wait_rsp_cmd != 0U && rsp->cmd == esb_wait_rsp_cmd) {
+		esb_wait_rsp_cmd = 0U;
+		k_sem_give(&esb_rsp_sem);
+	}
+
 	if (rsp->status != 0) {
 		HUB_ERR_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP FAILED\n");
 		if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
-			esb_pair_session_end();
+			esb_pair_session_end(false);
 		}
 		return;
 	}
@@ -607,18 +690,21 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 			HUB_ERR_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP cfg decode failed (len=%u need=%u)\n",
 			       rsp->data_len, (unsigned int)sizeof(cfg));
 			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
-				esb_pair_session_end();
+				esb_pair_session_end(false);
 			}
 		}
 		break;
 	case UART_RC_ESB_CMD_SET_ADDR:
 		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] addresses staged\n");
 		break;
+	case UART_RC_ESB_CMD_SET_RADIO:
+		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] radio params staged\n");
+		break;
 	case UART_RC_ESB_CMD_APPLY:
 		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] radio applied\n");
 		break;
 	case UART_RC_ESB_CMD_SAVE:
-		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] config saved\n");
+		HUB_DBG_M(HUB_MOD_UART, "[UART<-PTX] SAVE (PTX no-op; Hub owns flash)\n");
 		break;
 	default:
 		break;
@@ -649,10 +735,10 @@ static void on_uart_debug_log(const struct uart_rc_debug_log *log, void *user_da
 
 		if (strstr(line, "PRX ACK on PAIR") != NULL ||
 		    strstr(line, "PAIR broadcast ended") != NULL) {
-			esb_pair_session_end();
+			esb_pair_session_end(true);
 			HUB_DBG_M(HUB_MOD_ESB, "[PAIR] session complete (from PTX log)\n");
 		} else if (strstr(line, "PAIR broadcast timed out") != NULL) {
-			esb_pair_session_end();
+			esb_pair_session_end(false);
 			HUB_ERR_M(HUB_MOD_ESB, "[PAIR] session failed: PTX timed out waiting for PRX ACK\n");
 		}
 	}
@@ -693,18 +779,25 @@ static int uart_hub_send_debug_ctrl(uint8_t flags, uint8_t level)
 	return uart_rc_link_send_debug_ctrl(&uart_link, &ctrl);
 }
 
-static void uart_hub_query_esb_config(void)
+static int uart_hub_apply_esb_config(const struct uart_rc_esb_config *cfg)
 {
-	(void)uart_hub_send_esb_req(UART_RC_ESB_CMD_GET_CONFIG, NULL, 0U);
-}
-
-static int uart_hub_sync_esb_config(const struct uart_rc_esb_config *cfg)
-{
+	uint8_t radio_payload[5];
 	uint8_t addr_payload[16];
 	int err;
 
 	if (cfg == NULL) {
 		return -EINVAL;
+	}
+
+	radio_payload[0] = cfg->bitrate;
+	radio_payload[1] = (uint8_t)cfg->tx_power;
+	sys_put_le16(cfg->retransmit_delay, &radio_payload[2]);
+	radio_payload[4] = cfg->pipe;
+
+	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_SET_RADIO, radio_payload,
+				    sizeof(radio_payload));
+	if (err != 0) {
+		return err;
 	}
 
 	memcpy(&addr_payload[0], cfg->base0, 4U);
@@ -717,12 +810,34 @@ static int uart_hub_sync_esb_config(const struct uart_rc_esb_config *cfg)
 		return err;
 	}
 
-	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_APPLY, NULL, 0U);
-	if (err != 0) {
-		return err;
+	/* PTX has no local pair store — APPLY only (no SAVE). */
+	return uart_hub_send_esb_req(UART_RC_ESB_CMD_APPLY, NULL, 0U);
+}
+
+static void uart_hub_restore_esb_config_to_ptx(void)
+{
+	int err;
+
+	if (!uart_paired_cfg_valid) {
+		HUB_INF_M(HUB_MOD_ESB, "No Hub-saved ESB config — hold Btn1/P1.02 to OTA pair\n");
+		return;
 	}
 
-	return uart_hub_send_esb_req(UART_RC_ESB_CMD_SAVE, NULL, 0U);
+	err = uart_hub_apply_esb_config(&uart_paired_cfg);
+	if (err != 0) {
+		HUB_ERR_M(HUB_MOD_ESB, "Boot push ESB config to PTX failed: %d\n", err);
+		return;
+	}
+
+	HUB_INF_M(HUB_MOD_ESB, "Pushed Hub-saved ESB config to PTX (SET_RADIO/SET_ADDR/APPLY)\n");
+	uart_log_esb_cfg(&uart_paired_cfg);
+}
+
+static void esb_boot_restore_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	uart_hub_restore_esb_config_to_ptx();
 }
 
 static void uart_hub_trigger_esb_ptx_pair(void)
@@ -740,7 +855,7 @@ static void uart_hub_trigger_esb_ptx_pair(void)
 
 	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_PAIR, NULL, 0U);
 	if (err != 0) {
-		esb_pair_session_end();
+		esb_pair_session_end(false);
 		HUB_ERR_M(HUB_MOD_ESB, "[PAIR] ESB_REQ PAIR send failed (err %d)\n", err);
 		return;
 	}
@@ -755,17 +870,190 @@ static void uart_hub_trigger_esb_prx_pair(void)
 	int err;
 
 	if (!uart_paired_cfg_valid) {
-		HUB_ERR_M(HUB_MOD_ESB, "No PTX pair data — hold Btn1/P1.02 (pair PTX) first\n");
+		HUB_ERR_M(HUB_MOD_ESB, "No Hub ESB config — hold Btn1/P1.02 (pair) first\n");
 		return;
 	}
 
-	err = uart_hub_sync_esb_config(&uart_paired_cfg);
+	err = uart_hub_apply_esb_config(&uart_paired_cfg);
 	if (err != 0) {
-		HUB_ERR_M(HUB_MOD_ESB, "ESB PRX pair/sync failed (err %d)\n", err);
+		HUB_ERR_M(HUB_MOD_ESB, "ESB UART apply failed (err %d)\n", err);
 		return;
 	}
 
-	HUB_INF_M(HUB_MOD_ESB, "ESB PRX pair/sync started (SET_ADDR/APPLY/SAVE on UART device)\n");
+	HUB_INF_M(HUB_MOD_ESB, "ESB config applied on UART device (SET_RADIO/SET_ADDR/APPLY)\n");
+}
+
+void hub_esb_snapshot(struct hub_esb_snapshot *out)
+{
+	int64_t now;
+
+	if (out == NULL) {
+		return;
+	}
+
+	memset(out, 0, sizeof(*out));
+	out->hub_cfg_ram_valid = uart_paired_cfg_valid;
+	out->hub_cfg_flash_valid = uart_esb_cfg_saved_valid;
+	out->pair_session_active = esb_pair_session_active;
+	out->log_forward = uart_debug_forward_enabled;
+	out->xbox_ctrl_active = (hids.conn != NULL);
+	if (uart_paired_cfg_valid) {
+		out->hub_cfg = uart_paired_cfg;
+	} else if (uart_esb_cfg_saved_valid) {
+		out->hub_cfg = uart_esb_cfg_saved;
+	}
+
+	k_mutex_lock(&data_mutex, K_FOREVER);
+	out->last_status_valid = esb_last_status_valid;
+	if (esb_last_status_valid) {
+		out->last_status = esb_last_status;
+		now = k_uptime_get();
+		out->last_status_age_ms = now - esb_last_status_uptime_ms;
+	} else {
+		out->last_status_age_ms = -1;
+	}
+	k_mutex_unlock(&data_mutex);
+
+	if (esb_last_ptx_rsp_seen) {
+		out->last_ptx_rsp_age_ms = k_uptime_get() - esb_last_ptx_rsp_uptime_ms;
+	} else {
+		out->last_ptx_rsp_age_ms = -1;
+	}
+}
+
+int hub_esb_get_cfg(struct uart_rc_esb_config *cfg)
+{
+	if (cfg == NULL) {
+		return -EINVAL;
+	}
+	if (!uart_paired_cfg_valid && !uart_esb_cfg_saved_valid) {
+		return -ENOENT;
+	}
+	*cfg = uart_paired_cfg_valid ? uart_paired_cfg : uart_esb_cfg_saved;
+	return 0;
+}
+
+int hub_esb_force_pair(void)
+{
+	if (esb_pair_session_active) {
+		return -EBUSY;
+	}
+	uart_hub_trigger_esb_ptx_pair();
+	return esb_pair_session_active ? 0 : -EIO;
+}
+
+int hub_esb_push_to_ptx(void)
+{
+	if (!uart_paired_cfg_valid && !uart_esb_cfg_saved_valid) {
+		return -ENOENT;
+	}
+	if (!uart_paired_cfg_valid) {
+		uart_paired_cfg = uart_esb_cfg_saved;
+		uart_paired_cfg_valid = true;
+	}
+	return uart_hub_apply_esb_config(&uart_paired_cfg);
+}
+
+int hub_esb_ping_ptx(struct uart_rc_esb_config *cfg)
+{
+	int err;
+
+	(void)k_sem_take(&esb_rsp_sem, K_NO_WAIT);
+	esb_wait_rsp_cmd = UART_RC_ESB_CMD_GET_CONFIG;
+	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_GET_CONFIG, NULL, 0U);
+	if (err != 0) {
+		esb_wait_rsp_cmd = 0U;
+		return err;
+	}
+
+	err = k_sem_take(&esb_rsp_sem, K_MSEC(ESB_PING_TIMEOUT_MS));
+	esb_wait_rsp_cmd = 0U;
+	if (err != 0) {
+		return -ETIMEDOUT;
+	}
+	if (!esb_last_rsp_valid || esb_last_rsp.cmd != UART_RC_ESB_CMD_GET_CONFIG) {
+		return -EIO;
+	}
+
+	/* Any GET_CONFIG RSP means PTX is on the wire. */
+	if (esb_last_rsp.status != 0) {
+		return (cfg != NULL) ? -ENODATA : 0;
+	}
+	if (cfg == NULL) {
+		return 0;
+	}
+	if (esb_last_rsp.data_len < sizeof(*cfg) ||
+	    uart_rc_link_decode_esb_config(esb_last_rsp.data, esb_last_rsp.data_len, cfg) != 0) {
+		return -ENODATA;
+	}
+
+	uart_paired_cfg = *cfg;
+	uart_paired_cfg_valid = true;
+	return 0;
+}
+
+int hub_esb_query_ptx(struct uart_rc_esb_config *cfg)
+{
+	int err;
+
+	(void)k_sem_take(&esb_rsp_sem, K_NO_WAIT);
+	esb_wait_rsp_cmd = UART_RC_ESB_CMD_GET_CONFIG;
+	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_GET_CONFIG, NULL, 0U);
+	if (err != 0) {
+		esb_wait_rsp_cmd = 0U;
+		return err;
+	}
+
+	err = k_sem_take(&esb_rsp_sem, K_MSEC(ESB_QUERY_TIMEOUT_MS));
+	esb_wait_rsp_cmd = 0U;
+	if (err != 0) {
+		return -ETIMEDOUT;
+	}
+	if (!esb_last_rsp_valid || esb_last_rsp.cmd != UART_RC_ESB_CMD_GET_CONFIG) {
+		return -EIO;
+	}
+	if (esb_last_rsp.status != 0) {
+		return esb_last_rsp.status;
+	}
+	if (cfg == NULL) {
+		return 0;
+	}
+	if (esb_last_rsp.data_len < sizeof(*cfg) ||
+	    uart_rc_link_decode_esb_config(esb_last_rsp.data, esb_last_rsp.data_len, cfg) != 0) {
+		return -EBADMSG;
+	}
+
+	uart_paired_cfg = *cfg;
+	uart_paired_cfg_valid = true;
+	return 0;
+}
+
+int hub_esb_set_log_forward(bool enable)
+{
+	uint8_t flags = enable ? UART_RC_DEBUG_FLAG_FORWARD : 0U;
+	int err;
+
+	err = uart_hub_send_debug_ctrl(flags, LOG_LEVEL_INF);
+	if (err == 0) {
+		uart_debug_forward_enabled = enable;
+	}
+	return err;
+}
+
+int hub_esb_clear_saved(void)
+{
+	int err;
+
+	err = settings_delete(SETTINGS_KEY_ESB_RADIO);
+	if (err != 0 && err != -ENOENT) {
+		return err;
+	}
+
+	uart_paired_cfg_valid = false;
+	uart_esb_cfg_saved_valid = false;
+	memset(&uart_paired_cfg, 0, sizeof(uart_paired_cfg));
+	memset(&uart_esb_cfg_saved, 0, sizeof(uart_esb_cfg_saved));
+	return 0;
 }
 
 static void esb_ptx_hold_handler(struct k_work *work)
@@ -1146,6 +1434,19 @@ static int settings_set_cb(const char *name, size_t len, settings_read_cb read_c
 
 		if (rd == sizeof(bonded_xbox_addr)) {
 			bonded_xbox_valid = true;
+			return 0;
+		}
+	}
+
+	if (strcmp(name, "esb_radio") == 0 && len == sizeof(struct hub_esb_store)) {
+		struct hub_esb_store store;
+		ssize_t rd = read_cb(cb_arg, &store, sizeof(store));
+
+		if (rd == (ssize_t)sizeof(store) && store.version == HUB_ESB_STORE_VERSION) {
+			uart_paired_cfg = store.cfg;
+			uart_paired_cfg_valid = true;
+			uart_esb_cfg_saved = store.cfg;
+			uart_esb_cfg_saved_valid = true;
 			return 0;
 		}
 	}
@@ -1772,6 +2073,7 @@ int main(void)
 	k_work_init_delayable(&esb_ptx_hold_work, esb_ptx_hold_handler);
 	k_work_init_delayable(&esb_debug_hold_work, esb_debug_hold_handler);
 	k_work_init_delayable(&esb_pair_watchdog_work, esb_pair_watchdog_handler);
+	k_work_init_delayable(&esb_boot_restore_work, esb_boot_restore_handler);
 	k_work_init_delayable(&uart_ctrl_heartbeat_work, uart_ctrl_heartbeat_handler);
 	memset(&latest_state, 0, sizeof(latest_state));
 	memset(&telemetry_data, 0, sizeof(telemetry_data));
@@ -1839,7 +2141,8 @@ int main(void)
 		return 0;
 	}
 
-	uart_hub_query_esb_config();
+	/* PTX has no local pair store — push Hub flash config shortly after link up. */
+	k_work_schedule(&esb_boot_restore_work, K_MSEC(ESB_BOOT_RESTORE_DELAY_MS));
 
 	k_work_schedule(&telemetry_work, K_MSEC(telemetry_interval_ms));
 	k_work_schedule(&uart_ctrl_heartbeat_work, K_MSEC(UART_CTRL_HEARTBEAT_MS));
@@ -1850,8 +2153,8 @@ int main(void)
 	HUB_INF_M(HUB_MOD_UART, "Scanning Xbox, advertising to phone, UART link enabled\n");
 	HUB_INF_M(HUB_MOD_UART, "UART CTRL heartbeat %u ms while Xbox connected\n",
 	       UART_CTRL_HEARTBEAT_MS);
-	HUB_INF_M(HUB_MOD_BQ, "Btn1: dump BQ25895 regs | Btn3: ESB PRX UART sync | "
+	HUB_INF_M(HUB_MOD_BQ, "Btn1: dump BQ25895 regs | Btn3: re-push ESB cfg to UART | "
 	       "Btn3 hold: debug log | Btn1(P1.02) hold: ESB OTA pair\n");
-	HUB_FORCE("Shell ready — flog show | loglevel | bq dump\n");
+	HUB_FORCE("Shell ready — flog show | loglevel | bq dump | esb status\n");
 	return 0;
 }

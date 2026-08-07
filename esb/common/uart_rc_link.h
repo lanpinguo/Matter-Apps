@@ -65,7 +65,7 @@
  *     SET_ADDR    -> data: base0[4], base1[4], prefixes[8]
  *     PAIR        -> data_len=0; generate random addresses, rsp returns uart_rc_esb_config
  *     APPLY       -> reinitialize ESB with staged config
- *     SAVE        -> persist staged config to flash (settings)
+ *     SAVE        -> persist staged config to flash (PRX only; PTX is Hub-owned / no-op)
  *
  * TYPE_DEBUG_CTRL (0x05)  Hub -> ESB PTX
  *   seq            u8

@@ -202,8 +202,8 @@ static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
 	rc_prx_pwm_apply_ctrl(ctrl);
 
 	/*
-	 * Keepalive (same channels) only refreshes the link timer — no flash.
-	 * Flash once when sticks/buttons actually change.
+	 * Keepalive (same channels) → solid idle LED.
+	 * Channel change → brief flash once per active frame.
 	 */
 	changed = ctrl_channels_changed(ctrl);
 	remember_ctrl_channels(ctrl);

@@ -2,7 +2,7 @@
  * SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
  */
 
-#include "rc_prx_status_led.h"
+#include "rc_ptx_status_led.h"
 
 #include <errno.h>
 
@@ -12,7 +12,7 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-LOG_MODULE_REGISTER(rc_prx_status_led, CONFIG_ESB_PRX_APP_LOG_LEVEL);
+LOG_MODULE_REGISTER(rc_ptx_status_led, CONFIG_ESB_PTX_APP_LOG_LEVEL);
 
 #if DT_NODE_EXISTS(DT_ALIAS(status_led))
 #define STATUS_LED_NODE DT_ALIAS(status_led)
@@ -25,19 +25,16 @@ static const struct gpio_dt_spec status_led = GPIO_DT_SPEC_GET(STATUS_LED_NODE, 
 /* 500 ms on / 500 ms off → 1 Hz when link lost. */
 #define LOST_PERIOD_MS       1000U
 #define PAIRING_PERIOD_MS     160U /* 80 ms on / 80 ms off */
-/* Brief off pulse on channel-change frames (idle is solid on). */
-#define ACTIVITY_FLASH_MS      80U
 /*
- * After the last CTRL (incl. keepalive), wait this long then 1 Hz lost blink.
- * Must be > Hub/PTX CTRL period (~100 ms).
+ * After the last CTRL TX_SUCCESS (PRX ACK), wait this long then 1 Hz lost blink.
+ * Must be > Hub CTRL / PTX TX interval (~100 ms).
  */
 #define LINK_LOST_TIMEOUT_MS  500U
 
 enum status_led_mode {
-	STATUS_LED_LOST = 0, /* no CTRL — 1 Hz */
-	STATUS_LED_IDLE,     /* CTRL alive — solid on */
-	STATUS_LED_FLASH,    /* one-shot activity dip */
-	STATUS_LED_PAIRING,
+	STATUS_LED_LOST = 0, /* 1 Hz */
+	STATUS_LED_LINK,     /* solid */
+	STATUS_LED_PAIRING,  /* rapid */
 };
 
 static enum status_led_mode mode = STATUS_LED_LOST;
@@ -45,7 +42,6 @@ static bool led_on;
 static bool pairing_active;
 static struct k_work_delayable blink_work;
 static struct k_work_delayable lost_work;
-static struct k_work_delayable flash_work;
 
 static uint32_t period_for_mode(enum status_led_mode m)
 {
@@ -54,8 +50,7 @@ static uint32_t period_for_mode(enum status_led_mode m)
 		return PAIRING_PERIOD_MS;
 	case STATUS_LED_LOST:
 		return LOST_PERIOD_MS;
-	case STATUS_LED_IDLE:
-	case STATUS_LED_FLASH:
+	case STATUS_LED_LINK:
 	default:
 		return 0U;
 	}
@@ -78,20 +73,10 @@ static void apply_mode(enum status_led_mode next)
 	mode = next;
 	(void)k_work_cancel_delayable(&blink_work);
 
-	if (next == STATUS_LED_FLASH) {
-		/* Visible dip against solid idle. */
-		led_apply(false);
-		return;
-	}
-
-	if (next == STATUS_LED_IDLE) {
-		led_apply(true);
-		return;
-	}
-
 	period = period_for_mode(mode);
 	if (period == 0U) {
-		led_apply(false);
+		/* LINK: solid on. */
+		led_apply(true);
 		return;
 	}
 
@@ -107,9 +92,7 @@ static void blink_work_handler(struct k_work *work)
 
 	period = period_for_mode(mode);
 	if (period == 0U) {
-		if (mode == STATUS_LED_IDLE) {
-			led_apply(true);
-		}
+		led_apply(true);
 		return;
 	}
 
@@ -125,27 +108,10 @@ static void lost_work_handler(struct k_work *work)
 		return;
 	}
 
-	(void)k_work_cancel_delayable(&flash_work);
 	apply_mode(STATUS_LED_LOST);
 }
 
-static void flash_work_handler(struct k_work *work)
-{
-	ARG_UNUSED(work);
-
-	if (pairing_active) {
-		return;
-	}
-
-	if (mode != STATUS_LED_FLASH) {
-		return;
-	}
-
-	/* Resume solid idle while keepalive continues. */
-	apply_mode(STATUS_LED_IDLE);
-}
-
-int rc_prx_status_led_init(void)
+int rc_ptx_status_led_init(void)
 {
 #if !STATUS_LED_AVAILABLE
 	LOG_WRN("status-led alias missing — status LED disabled");
@@ -166,15 +132,14 @@ int rc_prx_status_led_init(void)
 
 	k_work_init_delayable(&blink_work, blink_work_handler);
 	k_work_init_delayable(&lost_work, lost_work_handler);
-	k_work_init_delayable(&flash_work, flash_work_handler);
 	pairing_active = false;
 	apply_mode(STATUS_LED_LOST);
-	LOG_INF("status LED — lost 1 Hz / idle solid / activity flash");
+	LOG_WRN("status LED P2.07 — lost 1 Hz / PRX link solid / pair rapid");
 	return 0;
 #endif
 }
 
-void rc_prx_status_led_on_link(void)
+void rc_ptx_status_led_on_link(void)
 {
 #if !STATUS_LED_AVAILABLE
 	return;
@@ -185,30 +150,13 @@ void rc_prx_status_led_on_link(void)
 
 	(void)k_work_reschedule(&lost_work, K_MSEC(LINK_LOST_TIMEOUT_MS));
 
-	/* Keepalive: solid on; do not interrupt an activity flash. */
-	if (mode == STATUS_LED_LOST) {
-		apply_mode(STATUS_LED_IDLE);
+	if (mode != STATUS_LED_LINK) {
+		apply_mode(STATUS_LED_LINK);
 	}
 #endif
 }
 
-void rc_prx_status_led_on_activity(void)
-{
-#if !STATUS_LED_AVAILABLE
-	return;
-#else
-	if (pairing_active) {
-		return;
-	}
-
-	(void)k_work_reschedule(&lost_work, K_MSEC(LINK_LOST_TIMEOUT_MS));
-	(void)k_work_cancel_delayable(&blink_work);
-	apply_mode(STATUS_LED_FLASH);
-	(void)k_work_reschedule(&flash_work, K_MSEC(ACTIVITY_FLASH_MS));
-#endif
-}
-
-void rc_prx_status_led_set_pairing(bool pairing)
+void rc_ptx_status_led_set_pairing(bool pairing)
 {
 #if !STATUS_LED_AVAILABLE
 	ARG_UNUSED(pairing);
@@ -216,12 +164,12 @@ void rc_prx_status_led_set_pairing(bool pairing)
 #else
 	pairing_active = pairing;
 	(void)k_work_cancel_delayable(&lost_work);
-	(void)k_work_cancel_delayable(&flash_work);
 
 	if (pairing) {
 		apply_mode(STATUS_LED_PAIRING);
 		return;
 	}
+
 	apply_mode(STATUS_LED_LOST);
 #endif
 }

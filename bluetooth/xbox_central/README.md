@@ -117,18 +117,40 @@ Message types (application payload inside HDLC):
     idle sticks still keep the ESB / PWM link alive; HID reports still push
     immediate CTRL for low latency.
 - `type=0x02` STATUS (ESB -> Hub): `seq(1), roll(i16), pitch(i16), yaw(i16), batt(u16), flags(1)`
-- `type=0x03/0x04` ESB_REQ/RSP: radio config, pair, apply, save
+- `type=0x03/0x04` ESB_REQ/RSP: radio config, pair, apply (SAVE is PRX-only / PTX no-op)
 - `type=0x05/0x06` DEBUG_CTRL/LOG: Btn3 long press toggles log forwarding from ESB PTX
+
+**ESB pairing persistence (Hub-owned):**
+
+- Successful OTA pair addresses are saved on **xbox_central** (`xbox_hub/esb_radio`)
+- **esb_ptx** does **not** store pair config; Hub pushes `SET_RADIO`/`SET_ADDR`/`APPLY` at boot
+- **esb_prx** still persists OTA pair locally (`esb_prx/radio`) for standalone rejoin
 
 Buttons:
 
-- **Btn1 (P1.02)** hold 1.5 s: ``PAIR`` on **esb_ptx** — generate/save addresses and broadcast OTA PAIR
-  until **esb_prx** ACKs (max 30 s; PRX must be in pair mode)
-- **Btn3** short press: optional UART sync of cached addresses to **esb_prx** (rewire Hub UART)
+- **Btn1 (P1.02)** hold 1.5 s: ``PAIR`` on **esb_ptx** — generate addresses, OTA broadcast until **esb_prx** ACKs (max 30 s); Hub saves config on success
+- **Btn3** short press: re-push Hub-saved ESB config to the UART device (SET_RADIO/SET_ADDR/APPLY)
 - **Btn3** hold 1.5 s: toggle ESB debug log forwarding to Hub console
 
 OTA pair checklist: PRX in pair mode → Hub UART to PTX → hold Btn1 (P1.02) 1.5s → wait for PRX
-``Paired from first valid pair frame``.
+``Paired from first valid pair frame``. After reboot, Hub restores PTX automatically.
+
+## ESB / PTX shell debug (console uart20 @ 115200)
+
+```text
+hub> esb status      # Hub cfg / pair / **PTX present ping** / last STATUS
+hub> esb ping        # 主动检测 esb_ptx 是否在 UART 上应答（GET_CONFIG，300 ms）
+hub> esb cfg         # dump Hub-saved addresses
+hub> esb get         # GET_CONFIG from PTX (waits ~800 ms)
+hub> esb push        # SET_RADIO/SET_ADDR/APPLY Hub cfg → PTX
+hub> esb pair        # force OTA PAIR (same as Btn1 hold 1.5 s)
+hub> esb log on      # forward PTX logs to Hub console
+hub> esb clear       # delete Hub flash xbox_hub/esb_radio
+```
+
+Pair tip: PRX in pair mode → `esb pair` (or Btn1 hold) → wait for ACK → Hub saves.
+After reboot Hub auto-pushes; `esb push` re-applies manually. Use `flog mirror on`
+if you want HUB_* lines on UART while pairing.
 
 ## BQ25895 shell debug (console uart20 @ 115200)
 

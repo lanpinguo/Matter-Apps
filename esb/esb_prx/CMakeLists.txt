@@ -10,9 +10,11 @@ project(esb_prx)
 
 target_include_directories(app PRIVATE ../common)
 
+# PRX keeps local flash so it can rejoin after power-cycle without Hub UART.
 target_compile_definitions(app PRIVATE
   ESB_RADIO_SUBTREE=\"esb_prx\"
   ESB_RADIO_MODE=ESB_MODE_PRX
+  RC_ESB_RADIO_PERSIST=1
 )
 
 target_sources(app PRIVATE

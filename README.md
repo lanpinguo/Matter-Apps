@@ -16,8 +16,8 @@ Xbox (BLE) ──► xbox_central (Hub) ──UART──► esb_ptx ──ESB 2.
 
 | 工程 | 路径 | 角色 |
 |------|------|------|
-| Ground BLE Hub | [`bluetooth/xbox_central`](bluetooth/xbox_central/) | Xbox Central + 手机 Peripheral；UART 下发 CTRL |
-| ESB PTX | [`esb/esb_ptx`](esb/esb_ptx/) | 接收 Hub UART，转发 ESB 控制帧；OTA 配对广播 |
+| Ground BLE Hub | [`bluetooth/xbox_central`](bluetooth/xbox_central/) | Xbox Central + 手机 Peripheral；UART 下发 CTRL；**持久化 ESB 配对并上电灌入 PTX** |
+| ESB PTX | [`esb/esb_ptx`](esb/esb_ptx/) | 接收 Hub UART，转发 ESB；OTA 配对广播（**不存**配对 flash） |
 | ESB PRX | [`esb/esb_prx`](esb/esb_prx/) | 接收 ESB；PCA9685 **9** 路 RC PWM；状态经 ACK 回传 |
 | 公共协议 | [`esb/common`](esb/common/) | HDLC UART RC、ESB 帧、radio settings |
 
@@ -53,7 +53,8 @@ GND                    <-->  GND
 
 1. PRX 进入 pair mode（无保存配置，或长按 PRX **Btn1 (P1.02)** 5 s）
 2. Hub UART 接 PTX，长按 Hub **Btn1 (P1.02)** 1.5 s → PTX 广播 ESB `PAIR`
-3. PRX 收包保存地址；PTX 收到 ACK 后进入 CTRL 转发
+3. PRX 收包保存地址；PTX 收到 ACK 后进入 CTRL 转发；**Hub 将配对配置写入 flash**
+4. 之后上电：Hub 自动 `SET_RADIO`/`SET_ADDR`/`APPLY` 灌回 PTX（PTX 本地不存配对）
 
 详情见各子目录 README。
 

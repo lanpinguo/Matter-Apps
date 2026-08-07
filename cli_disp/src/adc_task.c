@@ -143,6 +143,7 @@ static void adc_task_thread(void *p1, void *p2, void *p3)
 				adc_values.valid[channel_index] = false;
 			}
 		}
+		
 		k_mutex_unlock(&adc_values.mutex);
 	}
 }
@@ -180,6 +181,31 @@ static int cmd_adc_show(const struct shell *sh, size_t argc, char **argv)
 }
 
 SHELL_CMD_REGISTER(adc, NULL, "Show ADC channel values", cmd_adc_show);
+
+size_t adc_task_get_values(int16_t *raw, int32_t *mv, bool *valid, size_t max_count)
+{
+	size_t n = (max_count < CHANNEL_COUNT) ? max_count : CHANNEL_COUNT;
+
+	if (raw == NULL && mv == NULL && valid == NULL) {
+		return n;
+	}
+
+	k_mutex_lock(&adc_values.mutex, K_FOREVER);
+	for (size_t i = 0; i < n; i++) {
+		if (raw != NULL) {
+			raw[i] = adc_values.raw[i];
+		}
+		if (mv != NULL) {
+			mv[i] = adc_values.mv[i];
+		}
+		if (valid != NULL) {
+			valid[i] = adc_values.valid[i];
+		}
+	}
+	k_mutex_unlock(&adc_values.mutex);
+
+	return n;
+}
 
 void adc_task_enable(void)
 {
