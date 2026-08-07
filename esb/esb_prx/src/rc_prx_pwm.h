@@ -14,7 +14,10 @@
 
 int rc_prx_pwm_init(void);
 
-/** Update PWM pulse widths from a CTRL frame (channels 0..N-1, 0..1000). */
+/**
+ * Queue PWM update from a CTRL frame (ISR-safe).
+ * Actual I2C/PCA9685 writes run on the system workqueue.
+ */
 void rc_prx_pwm_apply_ctrl(const struct rc_link_frame *ctrl);
 
 #endif /* RC_PRX_PWM_H_ */

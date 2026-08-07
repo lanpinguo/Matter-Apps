@@ -35,16 +35,20 @@
 
 LOG_MODULE_REGISTER(esb_prx, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
-#define KEY_RADIO_CLEAR            DK_BTN4_MSK
+#define KEY_RADIO_CLEAR            DK_BTN1_MSK
 #define RADIO_CLEAR_HOLD_TIME_MS  5000
+/* Pair-mode LED: 80 ms on / 80 ms off (~6 Hz), distinct from CTRL-driven pattern. */
+#define PAIR_LED_HALF_PERIOD_MS   80
 
 static uint8_t status_seq;
 static uint8_t last_ctrl_seq;
 static uint8_t peer_ctrl_channels;
 static bool pairing_mode;
 static bool radio_clear_armed;
+static bool pair_led_on;
 static struct k_work_delayable radio_clear_work;
 static struct k_work_delayable pair_apply_work;
+static struct k_work_delayable pair_led_work;
 static struct rc_link_pair_payload pending_pair_payload;
 static bool pending_pair_valid;
 static struct esb_payload rx_payload;
@@ -63,6 +67,39 @@ static void leds_update(uint8_t value)
 		(!(value % 8 > 3) ? DK_LED4_MSK : 0);
 
 	dk_set_leds(leds_mask);
+}
+
+static void pair_led_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!pairing_mode) {
+		pair_led_on = false;
+		dk_set_led(DK_LED1, 0);
+		return;
+	}
+
+	pair_led_on = !pair_led_on;
+	dk_set_led(DK_LED1, pair_led_on ? 1 : 0);
+	(void)k_work_reschedule(&pair_led_work, K_MSEC(PAIR_LED_HALF_PERIOD_MS));
+}
+
+static void pairing_mode_set(bool enable)
+{
+	if (pairing_mode == enable) {
+		return;
+	}
+
+	pairing_mode = enable;
+	if (enable) {
+		pair_led_on = false;
+		(void)k_work_reschedule(&pair_led_work, K_NO_WAIT);
+		LOG_INF("Pair LED: rapid blink on DK_LED1");
+	} else {
+		(void)k_work_cancel_delayable(&pair_led_work);
+		pair_led_on = false;
+		dk_set_led(DK_LED1, 0);
+	}
 }
 
 static int queue_status_payload(void)
@@ -107,11 +144,11 @@ static void pair_apply_work_handler(struct k_work *work)
 	err = rc_esb_radio_apply_pair_payload(&pending_pair_payload, true);
 	if (err != 0) {
 		LOG_ERR("Pair apply/save failed: %d", err);
-		pairing_mode = true;
+		pairing_mode_set(true);
 		return;
 	}
 
-	pairing_mode = false;
+	pairing_mode_set(false);
 	LOG_WRN("Paired from first valid pair frame and saved");
 }
 
@@ -141,7 +178,7 @@ static void handle_pair_frame(const struct rc_link_frame *frame)
 
 	pending_pair_payload = pair_payload;
 	pending_pair_valid = true;
-	pairing_mode = false;
+	pairing_mode_set(false);
 	LOG_WRN("PAIR frame RX — apply in %d ms (after ACK)", PAIR_APPLY_DELAY_MS);
 	(void)k_work_schedule(&pair_apply_work, K_MSEC(PAIR_APPLY_DELAY_MS));
 }
@@ -162,7 +199,7 @@ static void handle_ctrl_frame(const struct rc_link_frame *ctrl)
 	rc_link_log_channels("Control", ctrl);
 	rc_prx_pwm_apply_ctrl(ctrl);
 
-	if (ctrl->channel_count > 1U) {
+	if (!pairing_mode && ctrl->channel_count > 1U) {
 		leds_update((uint8_t)ctrl->channels[1]);
 	}
 }
@@ -199,7 +236,7 @@ static void radio_clear_work_handler(struct k_work *work)
 		return;
 	}
 
-	pairing_mode = true;
+	pairing_mode_set(true);
 	LOG_INF("Radio config cleared, re-enter pair mode");
 }
 
@@ -214,7 +251,7 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 		if ((button_state & KEY_RADIO_CLEAR) != 0U) {
 		radio_clear_armed = true;
 		k_work_schedule(&radio_clear_work, K_MSEC(RADIO_CLEAR_HOLD_TIME_MS));
-		LOG_INF("Hold button %lu to clear radio config (5s)", (unsigned long)KEY_RADIO_CLEAR);
+		LOG_INF("Hold Btn1 (P1.02) 5s to clear radio config");
 	} else {
 		radio_clear_armed = false;
 		(void)k_work_cancel_delayable(&radio_clear_work);
@@ -352,6 +389,7 @@ int main(void)
 
 	k_work_init_delayable(&radio_clear_work, radio_clear_work_handler);
 	k_work_init_delayable(&pair_apply_work, pair_apply_work_handler);
+	k_work_init_delayable(&pair_led_work, pair_led_work_handler);
 	radio_clear_armed = false;
 	dk_buttons_init(button_handler);
 
@@ -360,11 +398,12 @@ int main(void)
 		LOG_ERR("ESB initialization failed, err %d", err);
 		return 0;
 	}
-	pairing_mode = !rc_esb_radio_has_saved_config();
-	if (pairing_mode) {
+	if (!rc_esb_radio_has_saved_config()) {
+		pairing_mode_set(true);
 		LOG_WRN("No saved radio config — pair mode ON (waiting ESB PAIR)");
 	} else {
-		LOG_WRN("Saved radio config loaded — pair mode OFF (hold Btn4 5s to clear)");
+		pairing_mode = false;
+		LOG_WRN("Saved radio config loaded — pair mode OFF (hold Btn1/P1.02 5s to clear)");
 	}
 
 	err = rc_uart_bridge_init();
@@ -375,8 +414,7 @@ int main(void)
 
 	err = rc_prx_pwm_init();
 	if (err) {
-		LOG_ERR("RC PWM init failed, err %d", err);
-		return 0;
+		LOG_ERR("RC PWM init failed, err %d (ESB continues without PWM)", err);
 	}
 
 	LOG_INF("Local status sources: %u (max)", (unsigned int)rc_prx_status_bank.slot_count);

@@ -18,22 +18,22 @@ Xbox (BLE) ──► xbox_central (Hub) ──UART──► esb_ptx ──ESB 2.
 |------|------|------|
 | Ground BLE Hub | [`bluetooth/xbox_central`](bluetooth/xbox_central/) | Xbox Central + 手机 Peripheral；UART 下发 CTRL |
 | ESB PTX | [`esb/esb_ptx`](esb/esb_ptx/) | 接收 Hub UART，转发 ESB 控制帧；OTA 配对广播 |
-| ESB PRX | [`esb/esb_prx`](esb/esb_prx/) | 接收 ESB；5 路 RC PWM；状态经 ACK 回传 |
+| ESB PRX | [`esb/esb_prx`](esb/esb_prx/) | 接收 ESB；PCA9685 5 路 RC PWM；状态经 ACK 回传 |
 | 公共协议 | [`esb/common`](esb/common/) | HDLC UART RC、ESB 帧、radio settings |
 
 ### 控制通道与 PWM
 
 Hub 下发 6 路：`LX, LY, RX, RY, LT, RT`。
 
-PRX PWM（仅 **Port P1**，50 Hz，脉宽 1000–2000 µs）：
+PRX PWM（**PCA9685**，I2C `0x64` / A2+A5 拉高；SCL P1.12、SDA P1.13；OE=P2.10；50 Hz，脉宽 1000–2000 µs）：
 
-| PWM | 管脚 | 来源 | 说明 |
-|-----|------|------|------|
-| CH0 | P1.11 | LX | 左摇杆 X（0..1000） |
-| CH1 | P1.12 | LY | 左摇杆 Y |
-| CH2 | P1.06 | RX | 右摇杆 X |
-| CH3 | P1.07 | RY | 右摇杆 Y |
-| CH4 | P1.10 | **RT** | **油门**；Hub 发原始 0..1023，PRX 侧归一化 |
+| PWM | PCA9685 | 来源 | 说明 |
+|-----|---------|------|------|
+| CH0 | LED0 | LX | 左摇杆 X（0..1000） |
+| CH1 | LED1 | LY | 左摇杆 Y |
+| CH2 | LED2 | RX | 右摇杆 X |
+| CH3 | LED3 | RY | 右摇杆 Y |
+| CH4 | LED4 | **RT** | **油门**；Hub 发原始 0..1023，PRX 侧归一化 |
 
 失联 500 ms：摇杆回中、油门拉低。Hub 在 Xbox 已连接时每 100 ms 发 UART CTRL 心跳。
 
@@ -47,8 +47,8 @@ GND                    <-->  GND
 
 ### OTA 配对（简要）
 
-1. PRX 进入 pair mode（无保存配置，或长按 PRX **Btn4** 5 s）
-2. Hub UART 接 PTX，长按 Hub **Btn4** 1.5 s → PTX 广播 ESB `PAIR`
+1. PRX 进入 pair mode（无保存配置，或长按 PRX **Btn1 (P1.02)** 5 s）
+2. Hub UART 接 PTX，长按 Hub **Btn1 (P1.02)** 1.5 s → PTX 广播 ESB `PAIR`
 3. PRX 收包保存地址；PTX 收到 ACK 后进入 CTRL 转发
 
 详情见各子目录 README。

@@ -60,7 +60,8 @@
 #define KEY_PAIRING_ACCEPT             DK_BTN1_MSK
 #define KEY_PAIRING_REJECT             DK_BTN2_MSK
 #define KEY_ESB_PRX_PAIR               DK_BTN3_MSK
-#define KEY_ESB_PTX_PAIR               DK_BTN4_MSK
+/* P1.02 = button0 / DK_BTN1 — same pin as KEY_PAIRING_ACCEPT (short vs long). */
+#define KEY_ESB_PTX_PAIR               DK_BTN1_MSK
 #define ESB_BTN_HOLD_MS                1500
 #define ESB_PAIR_WATCHDOG_MS           32000
 
@@ -552,6 +553,13 @@ static void on_uart_status(const struct uart_rc_link_status *status, void *user_
 	}
 }
 
+static void esb_pair_session_end(void)
+{
+	esb_pair_session_active = false;
+	(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+	hub_status_led_set_pairing(false);
+}
+
 static void esb_pair_watchdog_handler(struct k_work *work)
 {
 	ARG_UNUSED(work);
@@ -560,7 +568,7 @@ static void esb_pair_watchdog_handler(struct k_work *work)
 		return;
 	}
 
-	esb_pair_session_active = false;
+	esb_pair_session_end();
 	HUB_ERR_M(HUB_MOD_ESB, "[PAIR] watchdog: no PTX pair-done within %d ms\n", ESB_PAIR_WATCHDOG_MS);
 	HUB_DBG_M(HUB_MOD_ESB, "[PAIR] check: PRX in pair mode? PTX UART logs above? ESB RF link?\n");
 }
@@ -577,8 +585,7 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 	if (rsp->status != 0) {
 		HUB_ERR_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP FAILED\n");
 		if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
-			esb_pair_session_active = false;
-			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+			esb_pair_session_end();
 		}
 		return;
 	}
@@ -594,14 +601,13 @@ static void on_uart_esb_rsp(const struct uart_rc_esb_rsp *rsp, void *user_data)
 			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
 				HUB_DBG_M(HUB_MOD_ESB, "[PAIR] PTX accepted PAIR — waiting OTA PRX ACK (max 30s)\n");
 				HUB_DBG_M(HUB_MOD_ESB, "[PAIR] Ensure esb_prx is in pair mode "
-				       "(no saved cfg, or hold PRX Btn4 5s)\n");
+				       "(no saved cfg, or hold PRX Btn1/P1.02 5s)\n");
 			}
 		} else {
 			HUB_ERR_M(HUB_MOD_UART, "[UART<-PTX] ESB_RSP cfg decode failed (len=%u need=%u)\n",
 			       rsp->data_len, (unsigned int)sizeof(cfg));
 			if (rsp->cmd == UART_RC_ESB_CMD_PAIR) {
-				esb_pair_session_active = false;
-				(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+				esb_pair_session_end();
 			}
 		}
 		break;
@@ -643,12 +649,10 @@ static void on_uart_debug_log(const struct uart_rc_debug_log *log, void *user_da
 
 		if (strstr(line, "PRX ACK on PAIR") != NULL ||
 		    strstr(line, "PAIR broadcast ended") != NULL) {
-			esb_pair_session_active = false;
-			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+			esb_pair_session_end();
 			HUB_DBG_M(HUB_MOD_ESB, "[PAIR] session complete (from PTX log)\n");
 		} else if (strstr(line, "PAIR broadcast timed out") != NULL) {
-			esb_pair_session_active = false;
-			(void)k_work_cancel_delayable(&esb_pair_watchdog_work);
+			esb_pair_session_end();
 			HUB_ERR_M(HUB_MOD_ESB, "[PAIR] session failed: PTX timed out waiting for PRX ACK\n");
 		}
 	}
@@ -727,6 +731,7 @@ static void uart_hub_trigger_esb_ptx_pair(void)
 
 	uart_paired_cfg_valid = false;
 	esb_pair_session_active = true;
+	hub_status_led_set_pairing(true);
 
 	/* Stream PTX pair logs to Hub console during the session. */
 	uart_debug_forward_enabled = true;
@@ -735,7 +740,7 @@ static void uart_hub_trigger_esb_ptx_pair(void)
 
 	err = uart_hub_send_esb_req(UART_RC_ESB_CMD_PAIR, NULL, 0U);
 	if (err != 0) {
-		esb_pair_session_active = false;
+		esb_pair_session_end();
 		HUB_ERR_M(HUB_MOD_ESB, "[PAIR] ESB_REQ PAIR send failed (err %d)\n", err);
 		return;
 	}
@@ -750,7 +755,7 @@ static void uart_hub_trigger_esb_prx_pair(void)
 	int err;
 
 	if (!uart_paired_cfg_valid) {
-		HUB_ERR_M(HUB_MOD_ESB, "No PTX pair data — press Btn4 (pair PTX) first\n");
+		HUB_ERR_M(HUB_MOD_ESB, "No PTX pair data — hold Btn1/P1.02 (pair PTX) first\n");
 		return;
 	}
 
@@ -1606,7 +1611,10 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 {
 	uint32_t button = button_state & has_changed;
 
-	/* Btn4 long press 1.5s = ESB PTX/PRX OTA pair (short press ignored). */
+	/*
+	 * Btn1 (P1.02): long press 1.5s = ESB OTA pair;
+	 * short press = BLE passkey accept, or BQ25895 dump when idle.
+	 */
 	if (button & KEY_ESB_PTX_PAIR) {
 		if ((button_state & KEY_ESB_PTX_PAIR) != 0U) {
 			esb_ptx_hold_armed = true;
@@ -1614,6 +1622,14 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 			k_work_schedule(&esb_ptx_hold_work, K_MSEC(ESB_BTN_HOLD_MS));
 		} else {
 			(void)k_work_cancel_delayable(&esb_ptx_hold_work);
+			if (esb_ptx_hold_armed && !esb_ptx_hold_fired) {
+				if (auth_conn != NULL) {
+					num_comp_reply(true);
+				} else {
+					HUB_FORCE("Button1: BQ25895 register dump\n");
+					bq25895_log_dump();
+				}
+			}
 			esb_ptx_hold_armed = false;
 		}
 	}
@@ -1651,21 +1667,6 @@ static void button_handler(uint32_t button_state, uint32_t has_changed)
 			phone_adv_resume();
 			restart_scan();
 		}
-	}
-
-	/* Btn1 (when not pairing): dump BQ25895 registers over console. */
-	if ((button & KEY_PAIRING_ACCEPT) != 0U && auth_conn == NULL &&
-	    (button_state & KEY_PAIRING_ACCEPT) != 0U) {
-		HUB_FORCE("Button1: BQ25895 register dump\n");
-		bq25895_log_dump();
-	}
-
-	if (!auth_conn) {
-		return;
-	}
-
-	if (button & KEY_PAIRING_ACCEPT) {
-		num_comp_reply(true);
 	}
 }
 
@@ -1846,7 +1847,7 @@ int main(void)
 	HUB_INF_M(HUB_MOD_UART, "UART CTRL heartbeat %u ms while Xbox connected\n",
 	       UART_CTRL_HEARTBEAT_MS);
 	HUB_INF_M(HUB_MOD_BQ, "Btn1: dump BQ25895 regs | Btn3: ESB PRX UART sync | "
-	       "Btn3 hold: debug log | Btn4 hold: ESB OTA pair\n");
+	       "Btn3 hold: debug log | Btn1(P1.02) hold: ESB OTA pair\n");
 	HUB_FORCE("Shell ready — flog show | loglevel | bq dump\n");
 	return 0;
 }

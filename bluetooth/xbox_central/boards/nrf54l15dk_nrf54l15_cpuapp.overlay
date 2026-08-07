@@ -106,9 +106,18 @@
 	pinctrl-names = "default", "sleep";
 };
 
-/* Button1 (DK_BTN1 / sw0): move off P1.13 (BQ25895 SDA) to P1.02 */
+/*
+ * Button1 (DK_BTN1 / sw0) on P1.02 for ESB OTA pair hold.
+ * P1.02 is NFC1 by default — release via &uicr { nfct-pins-as-gpios; }.
+ * Also keeps SW0 off P1.13 (BQ25895 SDA).
+ */
 &button0 {
 	gpios = <&gpio1 2 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
+};
+
+/* Required for P1.02/P1.03 as GPIO on nRF54L (injects NRF_CONFIG_NFCT_PINS_AS_GPIOS). */
+&uicr {
+	nfct-pins-as-gpios;
 };
 
 /*

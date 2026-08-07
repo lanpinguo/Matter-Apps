@@ -112,7 +112,7 @@ Message types (application payload inside HDLC):
 - `type=0x01` CTRL (Hub -> ESB): `seq(1), channel_count(1), channels[]` (LE u16)
   - channel_count is 6: `LX, LY, RX, RY, LT, RT`
   - sticks are 0..1000; triggers are raw 10-bit 0..1023 (normalized on esb_prx)
-  - **RT** is throttle (PRX PWM CH4 / P1.10); loose = idle, full press = max
+  - **RT** is throttle (PRX PCA9685 CH4 / LED4); loose = idle, full press = max
   - While Xbox is connected, Hub also sends CTRL every **100 ms** (heartbeat) so
     idle sticks still keep the ESB / PWM link alive; HID reports still push
     immediate CTRL for low latency.
@@ -122,12 +122,12 @@ Message types (application payload inside HDLC):
 
 Buttons:
 
-- **Btn4** hold 1.5 s: ``PAIR`` on **esb_ptx** — generate/save addresses and broadcast OTA PAIR
+- **Btn1 (P1.02)** hold 1.5 s: ``PAIR`` on **esb_ptx** — generate/save addresses and broadcast OTA PAIR
   until **esb_prx** ACKs (max 30 s; PRX must be in pair mode)
 - **Btn3** short press: optional UART sync of cached addresses to **esb_prx** (rewire Hub UART)
 - **Btn3** hold 1.5 s: toggle ESB debug log forwarding to Hub console
 
-OTA pair checklist: PRX in pair mode → Hub UART to PTX → hold Btn4 1.5s → wait for PRX
+OTA pair checklist: PRX in pair mode → Hub UART to PTX → hold Btn1 (P1.02) 1.5s → wait for PRX
 ``Paired from first valid pair frame``.
 
 ## BQ25895 shell debug (console uart20 @ 115200)

@@ -301,7 +301,7 @@ int main(void)
 {
 	int err;
 
-	LOG_WRN("ESB PTX ready (UART RC forward; Btn4 PAIR until PRX ACK)");
+	LOG_WRN("ESB PTX ready (UART RC forward; Hub Btn1/P1.02 PAIR until PRX ACK)");
 
 	err = clocks_start();
 	if (err) {

@@ -3,8 +3,12 @@
  */
 #include "rc_prx_pwm.h"
 
+#include <string.h>
+
 #include <zephyr/device.h>
 #include <zephyr/devicetree.h>
+#include <zephyr/drivers/gpio.h>
+#include <zephyr/drivers/i2c.h>
 #include <zephyr/drivers/pwm.h>
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
@@ -20,9 +24,13 @@ LOG_MODULE_REGISTER(rc_prx_pwm, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 #define RC_PWM_VALUE_MAX    1000U
 #define RC_PWM_FAILSAFE_MS  500U
 
+#define PCA9685_NODE DT_NODELABEL(pca9685)
+#define PCA9685_INIT_RETRIES 5
+#define PCA9685_INIT_RETRY_MS 20
+
 /*
- * PWM output i reads CTRL channel pwm_ctrl_index[i].
- * CH4 (P1.10) is throttle from Xbox RT.
+ * PWM output i reads CTRL channel pwm_ctrl_index[i] via PCA9685 LEDi.
+ * CH4 (LED4) is throttle from Xbox RT.
  */
 static const uint8_t pwm_ctrl_index[RC_PRX_PWM_CHANNEL_COUNT] = {
 	UART_RC_CH_LX,
@@ -45,8 +53,19 @@ static const struct pwm_dt_spec rc_pwms[RC_PRX_PWM_CHANNEL_COUNT] = {
 	PWM_DT_SPEC_GET(DT_NODELABEL(rc_pwm4)),
 };
 
+/* PCA9685 /OE is active-low (DT GPIO_ACTIVE_LOW). */
+static const struct gpio_dt_spec pca9685_oe = GPIO_DT_SPEC_GET(DT_NODELABEL(pca9685_oe), gpios);
+
+static const struct device *const pca9685_dev = DEVICE_DT_GET(PCA9685_NODE);
+static const struct i2c_dt_spec pca9685_i2c = I2C_DT_SPEC_GET(PCA9685_NODE);
+
 static struct k_work_delayable failsafe_work;
+static struct k_work pwm_apply_work;
 static bool pwm_ready;
+
+/* Latest CTRL snapshot — filled from ESB ISR, applied on system workqueue. */
+static uint16_t pending_channels[RC_LINK_MAX_CHANNELS];
+static uint8_t pending_channel_count;
 
 static uint32_t value_to_pulse_ns(uint16_t value)
 {
@@ -121,8 +140,98 @@ static void failsafe_work_handler(struct k_work *work)
 	apply_failsafe();
 }
 
+static void pwm_apply_work_handler(struct k_work *work)
+{
+	uint16_t channels[RC_LINK_MAX_CHANNELS];
+	uint8_t count;
+	unsigned int key;
+
+	ARG_UNUSED(work);
+
+	if (!pwm_ready) {
+		return;
+	}
+
+	key = irq_lock();
+	count = pending_channel_count;
+	if (count > RC_LINK_MAX_CHANNELS) {
+		count = RC_LINK_MAX_CHANNELS;
+	}
+	memcpy(channels, pending_channels, (size_t)count * sizeof(uint16_t));
+	irq_unlock(key);
+
+	apply_ctrl_channels(channels, count);
+	(void)k_work_reschedule(&failsafe_work, K_MSEC(RC_PWM_FAILSAFE_MS));
+}
+
+static void pca9685_i2c_scan(void)
+{
+	uint8_t dst;
+	int found = 0;
+
+	if (!i2c_is_ready_dt(&pca9685_i2c)) {
+		LOG_ERR("I2C bus not ready for PCA9685 scan");
+		return;
+	}
+
+	LOG_ERR("I2C scan 0x40..0x70 on %s (expect PCA9685 @ 0x%02x):",
+		pca9685_i2c.bus->name, pca9685_i2c.addr);
+	for (uint16_t addr = 0x40; addr <= 0x70; addr++) {
+		if (i2c_read(pca9685_i2c.bus, &dst, 1, addr) == 0) {
+			LOG_ERR("  ACK at 0x%02x", addr);
+			found++;
+		}
+	}
+	if (found == 0) {
+		LOG_ERR("  (no ACK — check VCC/GND, SCL=P1.12 SDA=P1.13, A2+A5→0x64)");
+	}
+}
+
+static int pca9685_bringup(void)
+{
+	int err = -ENODEV;
+
+	for (int i = 0; i < PCA9685_INIT_RETRIES; i++) {
+		if (device_is_ready(pca9685_dev)) {
+			return 0;
+		}
+
+		err = device_init(pca9685_dev);
+		if (err == 0 && device_is_ready(pca9685_dev)) {
+			return 0;
+		}
+
+		LOG_WRN("PCA9685 init attempt %d/%d failed: %d", i + 1,
+			PCA9685_INIT_RETRIES, err);
+		k_msleep(PCA9685_INIT_RETRY_MS);
+	}
+
+	return err != 0 ? err : -ENODEV;
+}
+
 int rc_prx_pwm_init(void)
 {
+	int err;
+
+	if (!gpio_is_ready_dt(&pca9685_oe)) {
+		LOG_ERR("PCA9685 OE GPIO not ready");
+		return -ENODEV;
+	}
+
+	/* Enable outputs (OE active-low) before talking to the chip. */
+	err = gpio_pin_configure_dt(&pca9685_oe, GPIO_OUTPUT_ACTIVE);
+	if (err != 0) {
+		LOG_ERR("PCA9685 OE configure failed: %d", err);
+		return err;
+	}
+
+	err = pca9685_bringup();
+	if (err != 0) {
+		LOG_ERR("PCA9685 device init failed: %d", err);
+		pca9685_i2c_scan();
+		return err;
+	}
+
 	for (uint8_t i = 0; i < RC_PRX_PWM_CHANNEL_COUNT; i++) {
 		if (!pwm_is_ready_dt(&rc_pwms[i])) {
 			LOG_ERR("PWM%u device not ready", i);
@@ -131,18 +240,36 @@ int rc_prx_pwm_init(void)
 	}
 
 	k_work_init_delayable(&failsafe_work, failsafe_work_handler);
+	k_work_init(&pwm_apply_work, pwm_apply_work_handler);
 	pwm_ready = true;
 	apply_failsafe();
-	LOG_INF("RC PWM ready: %u ch @ 50 Hz (CH4=RT throttle)", RC_PRX_PWM_CHANNEL_COUNT);
+	LOG_INF("RC PWM ready: PCA9685@0x%02x %u ch @ 50 Hz (OE=P2.10, CH4=RT)",
+		pca9685_i2c.addr, RC_PRX_PWM_CHANNEL_COUNT);
 	return 0;
 }
 
 void rc_prx_pwm_apply_ctrl(const struct rc_link_frame *ctrl)
 {
+	uint8_t count;
+	unsigned int key;
+
 	if (ctrl == NULL || !pwm_ready) {
 		return;
 	}
 
-	apply_ctrl_channels(ctrl->channels, ctrl->channel_count);
-	(void)k_work_reschedule(&failsafe_work, K_MSEC(RC_PWM_FAILSAFE_MS));
+	count = ctrl->channel_count;
+	if (count > RC_LINK_MAX_CHANNELS) {
+		count = RC_LINK_MAX_CHANNELS;
+	}
+
+	/*
+	 * ESB RX runs in ISR; PCA9685 pwm_set uses I2C (k_sem_take) and must
+	 * not run here — snapshot and defer to the system workqueue.
+	 */
+	key = irq_lock();
+	pending_channel_count = count;
+	memcpy(pending_channels, ctrl->channels, (size_t)count * sizeof(uint16_t));
+	irq_unlock(key);
+
+	(void)k_work_submit(&pwm_apply_work);
 }

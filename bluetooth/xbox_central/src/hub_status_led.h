@@ -16,6 +16,8 @@ enum hub_status_led_mode {
 	HUB_STATUS_LED_IDLE,
 	/** Faster blink: Xbox (or primary link) connected. */
 	HUB_STATUS_LED_ACTIVE,
+	/** Rapid blink: ESB OTA pairing in progress. */
+	HUB_STATUS_LED_PAIRING,
 	/** Solid on: fault / attention. */
 	HUB_STATUS_LED_FAULT,
 };
@@ -28,7 +30,10 @@ int hub_status_led_init(void);
 
 void hub_status_led_set_mode(enum hub_status_led_mode mode);
 
-/** Convenience: ACTIVE when @p connected, else IDLE (keeps FAULT if set). */
+/** Convenience: ACTIVE when @p connected, else IDLE (keeps FAULT/PAIRING if set). */
 void hub_status_led_set_xbox_connected(bool connected);
+
+/** Rapid blink while ESB OTA pair session is active; restores idle/active when done. */
+void hub_status_led_set_pairing(bool pairing);
 
 #endif /* HUB_STATUS_LED_H_ */

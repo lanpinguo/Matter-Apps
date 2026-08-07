@@ -7,7 +7,7 @@ Features
 --------
 
 * ESB PTX mode at 2 Mbps; forwards Hub UART CTRL frames over ESB
-* On Hub ``PAIR`` (Btn4): generate addresses, SAVE, broadcast OTA ``PAIR`` until PRX ACK (max 30 s)
+* On Hub ``PAIR`` (Btn1 / P1.02): generate addresses, SAVE, broadcast OTA ``PAIR`` until PRX ACK (max 30 s)
 * Receives aircraft status in ACK payloads (bidirectional link)
 * UART RC link on the **console UART** (uart20), multiplexed with printk logs
 * Pair with :file:`apps/esb/esb_prx` for end-to-end testing
@@ -41,7 +41,7 @@ Message types beyond stick channels:
 
 Hub DK buttons (when wired to ESB PTX console UART):
 
-* Button 4 hold 1.5 s — ``PAIR`` PTX: generate addresses, SAVE, broadcast OTA
+* **Btn1 (P1.02)** hold 1.5 s — ``PAIR`` PTX: generate addresses, SAVE, broadcast OTA
   ``PAIR`` until PRX ACK (max 30 s; PRX must be in pair mode)
 * Button 3 short press — optional UART sync of the same addresses to PRX (rewire Hub UART)
 * Button 3 hold 1.5 s — toggle ESB debug log forwarding
@@ -49,8 +49,8 @@ Hub DK buttons (when wired to ESB PTX console UART):
 OTA pairing
 ^^^^^^^^^^^
 
-1. Put PRX in pair mode (first boot with no saved config, or hold PRX button 4 for 5 s).
-2. Keep Hub UART wired to PTX; hold Hub **button 4** for 1.5 s.
+1. Put PRX in pair mode (first boot with no saved config, or hold PRX Btn1/P1.02 for 5 s).
+2. Keep Hub UART wired to PTX; hold Hub **Btn1 (P1.02)** for 1.5 s.
 3. Within the window PRX should ACK the PAIR frame; PTX then immediately enters
    UART CTRL forward mode on the new addresses (falls back to 30 s timeout).
 
