@@ -314,6 +314,9 @@ int rc_esb_radio_apply_cfg(const struct uart_rc_esb_config *cfg)
 		return -EINVAL;
 	}
 
+	/* Keep staged in sync so SAVE / reboot path and GET_CONFIG match HW. */
+	staged_cfg = *cfg;
+	staged_valid = true;
 	return rc_esb_radio_hw_apply(cfg);
 }
 
@@ -344,6 +347,8 @@ void rc_esb_radio_end_pair_broadcast(void)
 	}
 
 	pair_broadcast_until_ms = 0;
+	/* PAIR TX used default listen addr — restore staged (paired) addresses. */
+	(void)rc_esb_radio_apply();
 	LOG_WRN("PAIR broadcast ended — UART CTRL forward mode");
 }
 
@@ -355,6 +360,7 @@ bool rc_esb_radio_pair_broadcast_active(void)
 
 	if (k_uptime_get() >= pair_broadcast_until_ms) {
 		pair_broadcast_until_ms = 0;
+		(void)rc_esb_radio_apply();
 		LOG_WRN("PAIR broadcast timed out — UART CTRL forward mode");
 		return false;
 	}
@@ -424,6 +430,9 @@ int rc_esb_radio_init(rc_esb_event_handler_t handler)
 	if (!staged_valid) {
 		rc_esb_radio_defaults(&staged_cfg);
 		staged_valid = true;
+		LOG_WRN("No saved radio config — using default addresses");
+	} else {
+		LOG_WRN("Saved radio config loaded (subtree %s)", ESB_RADIO_SUBTREE);
 	}
 
 	return rc_esb_radio_apply();

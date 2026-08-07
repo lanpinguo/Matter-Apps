@@ -320,6 +320,12 @@ int main(void)
 		return 0;
 	}
 
+	if (rc_esb_radio_has_saved_config()) {
+		LOG_WRN("Paired addresses restored from flash — ready for CTRL");
+	} else {
+		LOG_WRN("No saved pair — hold Hub Btn1 to OTA PAIR with PRX");
+	}
+
 	err = rc_uart_bridge_init();
 	if (err) {
 		LOG_ERR("UART RC bridge init failed, err %d", err);
