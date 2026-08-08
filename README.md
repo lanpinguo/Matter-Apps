@@ -23,7 +23,7 @@ Xbox (BLE) ──► xbox_central (Hub) ──UART──► esb_ptx ──ESB 2.
 
 ### 控制通道与 PWM
 
-Hub 下发 9 路：`LX, LY, RX, RY, LT, RT, AUX0(A), AUX1(B), AUX2(LB)`。
+Hub 下发 9 路：`LX, LY, RX, RY, LT, RT, AUX0(A), AUX1(B), AUX2(drive)`。
 
 PRX PWM（**PCA9685**，I2C `0x64` / A2+A5 拉高；SCL P1.12、SDA P1.13；OE=P2.10；50 Hz，脉宽 1000–2000 µs）：
 
@@ -33,13 +33,13 @@ PRX PWM（**PCA9685**，I2C `0x64` / A2+A5 拉高；SCL P1.12、SDA P1.13；OE=P
 | CH1 | LED1 | LY | 左摇杆 Y |
 | CH2 | LED2 | RX | 右摇杆 X |
 | CH3 | LED3 | RY | 右摇杆 Y |
-| CH4 | LED4 | **RT** | **油门**；Hub 发原始 0..1023，PRX 侧归一化 |
-| CH5 | LED5 | LT | 左扳机（同归一化） |
+| CH4 | LED4 | **RT** | 右扳机（独立通道） |
+| CH5 | LED5 | LT | 左扳机（独立通道） |
 | CH6 | LED6 | AUX0 | Xbox **A**（松开 0 / 按下 1000） |
 | CH7 | LED7 | AUX1 | Xbox **B** |
-| CH8 | LED8 | AUX2 | Xbox **LB** |
+| CH8 | LED8 | **drive** | **前进/后退合一路**：RT→上半（500..1000），LT→下半（500..0），中位 500 |
 
-失联 500 ms：摇杆回中、油门/扳机/AUX 拉低。Hub 在 Xbox 已连接时每 100 ms 发 UART CTRL 心跳。
+失联 500 ms：摇杆与 CH8 回中、油门/扳机/AUX 开关拉低。Hub 在 Xbox 已连接时每 100 ms 发 UART CTRL 心跳。
 
 ### Hub ↔ PTX 接线（115200，仅 TX/RX/GND）
 

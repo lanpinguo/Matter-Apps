@@ -35,7 +35,7 @@ LOG_MODULE_REGISTER(rc_prx_pwm, CONFIG_ESB_PRX_APP_LOG_LEVEL);
 
 /*
  * PWM output i reads CTRL channel pwm_ctrl_index[i] via PCA9685 LEDi.
- * CH4 (LED4) is throttle from Xbox RT; CH5 = LT; CH6–8 = A/B/LB aux switches.
+ * CH4 = RT, CH5 = LT (raw triggers); CH6–7 = A/B; CH8 = LT/RT combined drive.
  */
 static const uint8_t pwm_ctrl_index[RC_PRX_PWM_CHANNEL_COUNT] = {
 	UART_RC_CH_LX,
@@ -49,9 +49,9 @@ static const uint8_t pwm_ctrl_index[RC_PRX_PWM_CHANNEL_COUNT] = {
 	UART_RC_CH_AUX2,
 };
 
-/* Sticks center; throttle/LT/aux failsafe low (1000 µs). */
+/* Sticks/drive center; throttle/LT/aux switches failsafe low. */
 static const uint16_t failsafe_values[RC_PRX_PWM_CHANNEL_COUNT] = {
-	500U, 500U, 500U, 500U, 0U, 0U, 0U, 0U, 0U,
+	500U, 500U, 500U, 500U, 0U, 0U, 0U, 0U, 500U,
 };
 
 static const struct pwm_dt_spec rc_pwms[RC_PRX_PWM_CHANNEL_COUNT] = {

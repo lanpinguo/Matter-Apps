@@ -79,6 +79,12 @@ static struct hub_flash_meta meta;
 static bool ready;
 static struct k_mutex lock;
 static struct k_work flush_work;
+/* Dedicated WQ so SPI erase/write never blocks HCI TX (system workqueue). */
+#define HUB_LOG_WQ_STACK_SIZE 2048
+#define HUB_LOG_WQ_PRIO       8
+static K_THREAD_STACK_DEFINE(hub_log_wq_stack, HUB_LOG_WQ_STACK_SIZE);
+static struct k_work_q hub_log_wq;
+static bool hub_log_wq_started;
 
 static uint8_t ram_ring[RAM_RING_SIZE];
 static size_t ram_in;
@@ -504,6 +510,12 @@ int hub_flash_log_init(void)
 
 	k_mutex_init(&lock);
 	k_work_init(&flush_work, flush_work_handler);
+	k_work_queue_init(&hub_log_wq);
+	k_work_queue_start(&hub_log_wq, hub_log_wq_stack,
+			   K_THREAD_STACK_SIZEOF(hub_log_wq_stack), HUB_LOG_WQ_PRIO,
+			   NULL);
+	(void)k_thread_name_set(&hub_log_wq.thread, "hub_flog");
+	hub_log_wq_started = true;
 
 	flash_dev = DEVICE_DT_GET(HUB_FLASH_NODE);
 	if (!device_is_ready(flash_dev)) {
@@ -585,7 +597,9 @@ void hub_flash_log_append(uint8_t mod, int level, const char *text, size_t len)
 	ram_used += 3U + len;
 	irq_unlock(key);
 
-	(void)k_work_submit(&flush_work);
+	if (hub_log_wq_started) {
+		(void)k_work_submit_to_queue(&hub_log_wq, &flush_work);
+	}
 }
 
 void hub_flash_log_flush(void)

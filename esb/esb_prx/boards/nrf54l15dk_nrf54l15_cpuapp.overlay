@@ -169,7 +169,7 @@
 
 		rc_pwm8: rc_pwm_8 {
 			pwms = <&pca9685 8 PWM_USEC(20000)>;
-			label = "RC PWM CH8 AUX2 LB (PCA9685 LED8)";
+			label = "RC PWM CH8 drive RT+/LT- (PCA9685 LED8)";
 		};
 	};
 };

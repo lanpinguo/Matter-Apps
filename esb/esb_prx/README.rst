@@ -33,11 +33,13 @@ CH4     LED4         RT throttle (raw 0..1023 → 1000..2000 µs)
 CH5     LED5         LT (raw 0..1023 → 1000..2000 µs)
 CH6     LED6         AUX0 / Xbox A (0 or 1000)
 CH7     LED7         AUX1 / Xbox B (0 or 1000)
-CH8     LED8         AUX2 / Xbox LB (0 or 1000)
+CH8     LED8         drive: RT→upper half, LT→lower half (center 500; car FWD/REV)
 ======= ============ ========================
 
-Trigger normalization (0..1023 → pulse) is done on PRX. If no CTRL frame
-arrives for 500 ms, outputs go to failsafe (sticks center, throttle/LT/AUX low).
+Trigger normalization (0..1023 → pulse) is done on PRX for CH4/CH5. CH8 is
+already 0..1000 from Hub (500 idle, >500 forward, <500 reverse). If no CTRL
+frame arrives for 500 ms, outputs go to failsafe (sticks/drive center,
+throttle/LT/AUX switches low).
 ``uart20`` uses TX/RX only (P1.04/P1.05). DK **SW0** is remapped off P1.13
 (SDA) to P1.02 so it does not conflict with I2C. Change ``i2c22`` pinctrl in the
 board overlay if SDA/SCL are wired differently.

@@ -110,7 +110,8 @@
 #define UART_RC_CH_RT              5U
 #define UART_RC_CH_AUX0            6U /* Xbox A → PRX PWM CH6 */
 #define UART_RC_CH_AUX1            7U /* Xbox B → PRX PWM CH7 */
-#define UART_RC_CH_AUX2            8U /* Xbox LB → PRX PWM CH8 */
+/* Combined drive: RT→upper half, LT→lower half (center 500) → PRX PWM CH8 */
+#define UART_RC_CH_AUX2            8U
 #define UART_RC_CH_COUNT_DEFAULT   9U
 
 #define UART_RC_ESB_CMD_GET_CONFIG 0x01U

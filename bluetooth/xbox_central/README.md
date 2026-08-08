@@ -110,9 +110,11 @@ Hardware flow control is not used; HDLC framing handles reliability at 115200.
 Message types (application payload inside HDLC):
 
 - `type=0x01` CTRL (Hub -> ESB): `seq(1), channel_count(1), channels[]` (LE u16)
-  - channel_count is 9: `LX, LY, RX, RY, LT, RT, AUX0(A), AUX1(B), AUX2(LB)`
-  - sticks/AUX are 0..1000; triggers are raw 10-bit 0..1023 (normalized on esb_prx)
-  - **RT** is throttle (PRX PCA9685 CH4 / LED4); loose = idle, full press = max
+  - channel_count is 9: `LX, LY, RX, RY, LT, RT, AUX0(A), AUX1(B), AUX2(drive)`
+  - sticks/AUX0–1 are 0..1000; triggers are raw 10-bit 0..1023 (normalized on esb_prx)
+  - **AUX2 / CH8**: combined drive for single-channel FWD/REV cars —
+    RT maps to upper half (500..1000), LT to lower half (500..0), idle=500
+  - **RT** also remains on CH4; **LT** on CH5
   - While Xbox is connected, Hub also sends CTRL every **100 ms** (heartbeat) so
     idle sticks still keep the ESB / PWM link alive; HID reports still push
     immediate CTRL for low latency.
