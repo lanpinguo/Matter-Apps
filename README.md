@@ -37,7 +37,7 @@ PRX PWM（**PCA9685**，I2C `0x64` / A2+A5 拉高；SCL P1.12、SDA P1.13；OE=P
 | CH5 | LED5 | LT | 左扳机（独立通道） |
 | CH6 | LED6 | AUX0 | Xbox **A**（松开 0 / 按下 1000） |
 | CH7 | LED7 | AUX1 | Xbox **B** |
-| CH8 | LED8 | **drive** | **前进/后退合一路**：RT→上半（500..1000），LT→下半（500..0），中位 500 |
+| CH8 | LED8 | **drive** | **前进/后退合一路**：RT→上半，LT→下半，中位 `500+ch8_trim`（手机可调） |
 
 失联 500 ms：摇杆与 CH8 回中、油门/扳机/AUX 开关拉低。Hub 在 Xbox 已连接时每 100 ms 发 UART CTRL 心跳。
 

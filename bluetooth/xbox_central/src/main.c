@@ -46,10 +46,15 @@
 #define POWER_HEARTBEAT_IDLE_MS        30000 /* SoC refresh when not charging */
 #define POWER_HEARTBEAT_CHARGING_MS     1000 /* Live charge telemetry for phone */
 #define CONFIG_PARAM_TELEMETRY_MS      1
+#define CONFIG_PARAM_CH8_TRIM          2
 #define SETTINGS_KEY_TELEMETRY_MS      "xbox_hub/telemetry_ms"
+#define SETTINGS_KEY_CH8_TRIM          "xbox_hub/ch8_trim"
 #define SETTINGS_KEY_XBOX_ADDR         "xbox_hub/xbox_addr"
 #define SETTINGS_KEY_ESB_RADIO         "xbox_hub/esb_radio"
 #define HUB_ESB_STORE_VERSION          1U
+#define CH8_TRIM_MIN                   (-100)
+#define CH8_TRIM_MAX                   100
+#define HUB_CFG_VERSION                2U
 
 /* Fast LE interval after connect (7.5–11.25 ms). */
 #define XBOX_CONN_INTERVAL_MIN           6U
@@ -158,6 +163,7 @@ struct hub_telemetry_payload {
 struct hub_cfg_payload {
 	uint8_t version;
 	uint16_t telemetry_interval_ms;
+	int16_t ch8_trim; /* AUX2/CH8 idle offset; applied after LT/RT combine */
 } __packed;
 
 static struct bt_conn *default_conn;
@@ -169,6 +175,7 @@ static struct hub_telemetry_payload telemetry_data;
 static struct hub_power_payload power_data;
 static struct k_work_delayable power_work;
 static uint16_t telemetry_interval_ms = TELEMETRY_DEFAULT_INTERVAL_MS;
+static int16_t ch8_trim;
 static int64_t last_report_log_ms;
 static bool discovery_active;
 static K_MUTEX_DEFINE(data_mutex);
@@ -717,6 +724,20 @@ static uint16_t lt_rt_to_drive_rc(uint16_t lt, uint16_t rt)
 	return (uint16_t)v;
 }
 
+/* Apply persisted CH8 neutral trim (fixes ESC creep at idle). */
+static uint16_t apply_ch8_trim(uint16_t drive)
+{
+	int32_t v = (int32_t)drive + (int32_t)ch8_trim;
+
+	if (v < 0) {
+		return 0U;
+	}
+	if (v > 1000) {
+		return 1000U;
+	}
+	return (uint16_t)v;
+}
+
 static void on_uart_status(const struct uart_rc_link_status *status, void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -1250,8 +1271,9 @@ static void uart_send_ctrl_from_state(const struct xbox_gamepad_state *s)
 	/* Aux switches: released=0, pressed=1000 (RC 3-pos mid unused). */
 	ctrl.channels[UART_RC_CH_AUX0] = s->btn_a ? 1000U : 0U;
 	ctrl.channels[UART_RC_CH_AUX1] = s->btn_b ? 1000U : 0U;
-	/* CH8 drive: RT upper half / LT lower half (car forward+reverse). */
-	ctrl.channels[UART_RC_CH_AUX2] = lt_rt_to_drive_rc(s->lt, s->rt);
+	/* CH8 drive: RT upper half / LT lower half + phone-tunable trim. */
+	ctrl.channels[UART_RC_CH_AUX2] =
+		apply_ch8_trim(lt_rt_to_drive_rc(s->lt, s->rt));
 
 	(void)uart_rc_link_send_ctrl(&uart_link, &ctrl);
 }
@@ -1376,6 +1398,19 @@ static int telemetry_interval_set(uint16_t new_ms)
 	return 0;
 }
 
+static int ch8_trim_set(int16_t trim)
+{
+	if (trim < CH8_TRIM_MIN || trim > CH8_TRIM_MAX) {
+		return -EINVAL;
+	}
+
+	ch8_trim = trim;
+	if (IS_ENABLED(CONFIG_SETTINGS)) {
+		settings_save_one(SETTINGS_KEY_CH8_TRIM, &ch8_trim, sizeof(ch8_trim));
+	}
+	return 0;
+}
+
 static ssize_t telemetry_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 				 void *buf, uint16_t len, uint16_t offset)
 {
@@ -1393,8 +1428,9 @@ static ssize_t cfg_read_cb(struct bt_conn *conn, const struct bt_gatt_attr *attr
 			   void *buf, uint16_t len, uint16_t offset)
 {
 	struct hub_cfg_payload cfg = {
-		.version = 1U,
+		.version = HUB_CFG_VERSION,
 		.telemetry_interval_ms = telemetry_interval_ms,
+		.ch8_trim = ch8_trim,
 	};
 
 	ARG_UNUSED(conn);
@@ -1406,6 +1442,7 @@ static ssize_t cfg_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *att
 {
 	const uint8_t *p = buf;
 	uint16_t value;
+	int16_t trim;
 	int err;
 
 	ARG_UNUSED(conn);
@@ -1423,6 +1460,17 @@ static ssize_t cfg_write_cb(struct bt_conn *conn, const struct bt_gatt_attr *att
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
 		HUB_INF_M(HUB_MOD_PHONE, "Config updated: telemetry_interval_ms=%u\n", telemetry_interval_ms);
+		return len;
+	}
+
+	if (p[0] == CONFIG_PARAM_CH8_TRIM) {
+		trim = (int16_t)value;
+		err = ch8_trim_set(trim);
+		if (err) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+		HUB_INF_M(HUB_MOD_PHONE, "Config updated: ch8_trim=%d (idle=%d)\n",
+			  ch8_trim, 500 + (int)ch8_trim);
 		return len;
 	}
 
@@ -1581,6 +1629,17 @@ static int settings_set_cb(const char *name, size_t len, settings_read_cb read_c
 			if (telemetry_interval_ms < TELEMETRY_MIN_INTERVAL_MS ||
 			    telemetry_interval_ms > TELEMETRY_MAX_INTERVAL_MS) {
 				telemetry_interval_ms = TELEMETRY_DEFAULT_INTERVAL_MS;
+			}
+			return 0;
+		}
+	}
+
+	if (strcmp(name, "ch8_trim") == 0 && len == sizeof(ch8_trim)) {
+		ssize_t rd = read_cb(cb_arg, &ch8_trim, sizeof(ch8_trim));
+
+		if (rd == sizeof(ch8_trim)) {
+			if (ch8_trim < CH8_TRIM_MIN || ch8_trim > CH8_TRIM_MAX) {
+				ch8_trim = 0;
 			}
 			return 0;
 		}

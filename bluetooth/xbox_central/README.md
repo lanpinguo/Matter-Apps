@@ -61,13 +61,17 @@ Packed struct:
 
 ### Config payload (read)
 
-`version(1), telemetry_interval_ms(u16)`
+`version(2), telemetry_interval_ms(u16), ch8_trim(i16)`
+
+- `ch8_trim`: AUX2/CH8 idle offset (`-100..100`), applied after LT/RT combine.
+  Effective idle = `500 + ch8_trim` (persisted in settings).
 
 ### Config write command
 
 `param_id(1), value_le16(2)`
 
 - `param_id = 1`: set telemetry interval in milliseconds (`20..500`)
+- `param_id = 2`: set CH8 trim as **signed** int16 LE (`-100..100`)
 
 ### Flash log over BLE
 
@@ -114,6 +118,7 @@ Message types (application payload inside HDLC):
   - sticks/AUX0–1 are 0..1000; triggers are raw 10-bit 0..1023 (normalized on esb_prx)
   - **AUX2 / CH8**: combined drive for single-channel FWD/REV cars —
     RT maps to upper half (500..1000), LT to lower half (500..0), idle=500
+    plus phone-tunable `ch8_trim` (`-100..100`, Config param 2)
   - **RT** also remains on CH4; **LT** on CH5
   - While Xbox is connected, Hub also sends CTRL every **100 ms** (heartbeat) so
     idle sticks still keep the ESB / PWM link alive; HID reports still push
