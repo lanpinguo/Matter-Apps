@@ -10,6 +10,10 @@
 #include "aws_iot_integration.h"
 #endif
 
+#ifdef CONFIG_APP_NETWORK_WATCHDOG
+#include "network_watchdog.h"
+#endif
+
 #include "app/matter_init.h"
 #include "app/task_executor.h"
 
@@ -333,7 +337,13 @@ CHIP_ERROR AppTask::Init()
 	/* Initialize trigger effect timer */
 	k_timer_init(&sTriggerEffectTimer, &AppTask::TriggerEffectTimerTimeoutCallback, nullptr);
 
-	return Nrf::Matter::StartServer();
+	ReturnErrorOnFailure(Nrf::Matter::StartServer());
+
+#ifdef CONFIG_APP_NETWORK_WATCHDOG
+	ReturnErrorOnFailure(NetworkWatchdog::Init());
+#endif
+
+	return CHIP_NO_ERROR;
 }
 
 CHIP_ERROR AppTask::StartApp()
