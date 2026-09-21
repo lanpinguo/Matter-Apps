@@ -41,5 +41,9 @@ target_sources(app PRIVATE
     ${CHIP_ROOT}/src/app/util/persistence/DeferredAttributePersistenceProvider.cpp
 )
 
+if(CONFIG_APP_NETWORK_WATCHDOG)
+    target_sources(app PRIVATE src/network_watchdog.cpp)
+endif()
+
 ncs_configure_data_model()
 # NORDIC SDK APP END

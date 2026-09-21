@@ -1,0 +1,41 @@
+#
+# Copyright (c) 2026
+#
+# SPDX-License-Identifier: LicenseRef-Nordic-5-Clause
+#
+
+menuconfig APP_NETWORK_WATCHDOG
+	bool "Reboot after prolonged Matter network loss"
+	default y
+	help
+	  When the device is commissioned and network-provisioned but stays
+	  offline (Thread detached / Wi-Fi disconnected) longer than the
+	  configured timeout, trigger a software reboot to recover.
+
+if APP_NETWORK_WATCHDOG
+
+config APP_NETWORK_WATCHDOG_TIMEOUT_SEC
+	int "Offline timeout before reboot (seconds)"
+	default 1800
+	range 60 86400
+	help
+	  Continuous offline duration required before calling sys_reboot().
+	  Default is 30 minutes.
+
+config APP_NETWORK_WATCHDOG_CHECK_INTERVAL_SEC
+	int "Connectivity check interval (seconds)"
+	default 60
+	range 10 600
+	help
+	  How often to poll Thread/Wi-Fi connectivity state.
+
+config APP_NETWORK_WATCHDOG_BOOT_GRACE_SEC
+	int "Boot grace period before monitoring (seconds)"
+	default 300
+	range 0 3600
+	help
+	  Delay after boot before offline timing starts, so the device can
+	  join the network after a reboot without immediate re-triggering.
+	  Default is 5 minutes.
+
+endif # APP_NETWORK_WATCHDOG

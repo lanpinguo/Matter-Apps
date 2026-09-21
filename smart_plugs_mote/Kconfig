@@ -23,3 +23,4 @@ source "${ZEPHYR_CONNECTEDHOMEIP_MODULE_DIR}/config/nrfconnect/chip-module/Kconf
 source "${ZEPHYR_NRF_MODULE_DIR}/samples/matter/common/src/Kconfig"
 source "Kconfig.zephyr"
 rsource "src/aws_iot_integration/Kconfig"
+rsource "src/Kconfig.network_watchdog"
