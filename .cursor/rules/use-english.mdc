@@ -1,0 +1,14 @@
+---
+description: Use English for all project source, comments, and commit messages
+alwaysApply: true
+---
+
+# Use English in this project
+
+Write all project artifacts in English:
+
+- Source comments, Kconfig help text, overlay notes, and docs
+- Identifiers, log strings, and commit messages
+- Do not add Chinese (or other non-English) comments or user-facing strings in code
+
+Chat replies to the user may still follow the user's language preference.
