@@ -124,8 +124,11 @@ int mlx90640_capture(struct mlx90640_frame *out)
 	}
 
 	/*
-	 * Chess mode: RAM keeps the previous subpage. Read two consecutive
-	 * subpages, then run CalculateTo once for a complete 32x24 image.
+	 * Chess mode: CalculateTo() only writes pixels that match the current
+	 * subpage (frameData[833]). The other half of result[] is left
+	 * untouched — so we must GetFrameData + CalculateTo for both
+	 * subpages, merging into s_to. A single CalculateTo leaves ~384
+	 * pixels at 0 °C and pins reported min to 0.
 	 */
 	while (subpages < 2) {
 		status = MLX90640_GetFrameData(MLX90640_ADDR, s_frame);
@@ -133,12 +136,14 @@ int mlx90640_capture(struct mlx90640_frame *out)
 			k_msleep(10);
 			continue;
 		}
+
+		ta = MLX90640_GetTa(s_frame, &s_params);
+		tr = ta - 8.0f; /* reflected-temperature estimate */
+		MLX90640_CalculateTo(s_frame, &s_params, MLX90640_EMISSIVITY, tr,
+				     s_to);
 		subpages++;
 	}
 
-	ta = MLX90640_GetTa(s_frame, &s_params);
-	tr = ta - 8.0f; /* reflected-temperature estimate */
-	MLX90640_CalculateTo(s_frame, &s_params, MLX90640_EMISSIVITY, tr, s_to);
 	MLX90640_BadPixelsCorrection(s_params.brokenPixels, s_to, 1, &s_params);
 	MLX90640_BadPixelsCorrection(s_params.outlierPixels, s_to, 1, &s_params);
 

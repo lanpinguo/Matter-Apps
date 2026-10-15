@@ -37,6 +37,18 @@ Fixed passkey: 123456
 
 配对 PIN：`123456`
 
+## 运行模式
+
+状态灯：**P2.07**（active-low）
+
+| 模式 | 条件 | LED (P2.07) | 热红外 | BLE |
+|------|------|-------------|--------|-----|
+| 工作 | App 已连接 | 常亮 | 采集并上报 | 已连接 |
+| 待机 | 未连接 | 慢闪 | 不读传感器 | 广播中 |
+| 深度休眠 | 待机满 5 分钟 | 灭 | 停止 | 停广播 |
+
+深度休眠后按 **Button1** 回到待机并重新广播。
+
 ## 手机 App
 
 ```bash
@@ -54,6 +66,16 @@ flutter run
 | Service | `5448524D-0001-1000-8000-00805F9B34FB` |
 | Frame Notify | `5448524D-0002-1000-8000-00805F9B34FB` |
 | Control Write | `5448524D-0003-1000-8000-00805F9B34FB` |
+| Power Notify/Read | `5448524D-0004-1000-8000-00805F9B34FB` |
+
+**Power payload** (14 bytes LE, BQ25895):
+
+```
+ver u8 | flags u8 | charge_state u8 | vbus_state u8 | fault u8 | batt_pct u8
+batt_mv u16 | sys_mv u16 | vbus_mv u16 | charge_ma u16
+```
+
+flags: bit0=valid, bit1=PG, bit2=VBUS present. Battery % is a rough Li-ion estimate from BATV.
 
 **帧分片**（每包）：
 

@@ -16,4 +16,5 @@ target_sources(app PRIVATE
   src/mlx90640_sensor.c
   src/mlx90640_i2c.c
   src/MLX90640_API.c
+  src/bq25895.c
 )

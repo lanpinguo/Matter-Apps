@@ -6,6 +6,7 @@
  *   MLX90640 GND  -> GND
  *   MLX90640 SCL  -> P1.12  (same as peripheral_status)
  *   MLX90640 SDA  -> P1.13
+ *   Status LED    -> P2.07 (DT led2 / DK_LED3), active-low
  *
  * Default I2C address 0x33 (7-bit). BAB / BAA share the same register map.
  *
@@ -15,11 +16,19 @@
 / {
 	aliases {
 		watchdog0 = &wdt31;
+		battery-charger = &bq25895;
+		status-led = &led2;
 	};
 
 	chosen {
 		nordic,pm-ext-flash = &mx25r64;
 	};
+};
+
+/* Status LED on P2.07 — external LED is active-low (same as xbox_central). */
+&led2 {
+	gpios = <&gpio2 7 GPIO_ACTIVE_LOW>;
+	label = "Status LED (P2.07, active-low)";
 };
 
 &cpuapp_rram {
@@ -74,5 +83,12 @@
 	mlx90640: mlx90640@33 {
 		compatible = "melexis,mlx90640";
 		reg = <0x33>;
+	};
+
+	/* BQ25895 fixed 7-bit address 0x6A. INT on P0.02 (same as xbox_central). */
+	bq25895: charger@6a {
+		compatible = "ti,bq25895";
+		reg = <0x6a>;
+		int-gpios = <&gpio0 2 (GPIO_PULL_UP | GPIO_ACTIVE_LOW)>;
 	};
 };
